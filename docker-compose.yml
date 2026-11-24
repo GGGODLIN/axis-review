@@ -43,7 +43,10 @@ services:
         python -m pip install 'dstack-sdk==0.6.0' -e "$$source[tee]"
         check_ref
         read -r -a pr_urls <<< "$$PR_URLS"
-        axis-review review "$${pr_urls[@]}" --config "$$source/config.phala.toml" --out /data/out
+        status=0
+        axis-review review "$${pr_urls[@]}" --config "$$source/config.phala.toml" --out /data/out || status=$$?
+        # Serve even when one PR fails: the other PRs' reports and the failed PR's diagnostics are only retrievable here.
+        printf 'axis-review review exited with status %s\n' "$$status" >&2
         exec axis-review serve /data/out --host 0.0.0.0 --port 8080
 
 volumes:

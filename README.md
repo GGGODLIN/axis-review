@@ -42,19 +42,21 @@ axis-review serve out --port 8080
 
 ## Deploy on Phala Cloud
 
-Install the [Phala CLI](https://docs.phala.com/phala-cloud/phala-cloud-cli/overview) and authenticate with `phala login`. Set `PHALA_API_KEY` from your secret store, generate `AXIS_REVIEW_SERVE_TOKEN` as above, set `AXIS_REVIEW_REF` to a published full 40-hex commit SHA, and set `PR_URLS` to a space-separated list of GitHub pull request URLs. If GitHub API access needs a token, pass `-e "GITHUB_TOKEN=$GITHUB_TOKEN"` to the same deployment command. The CLI encrypts the environment variables supplied with `-e`; see [Phala secure environment variables](https://docs.phala.com/phala-cloud/cvm/set-secure-environment-variables).
+Install the [Phala CLI](https://docs.phala.com/phala-cloud/phala-cloud-cli/overview) and authenticate with `phala login`. Set `PHALA_API_KEY` from your secret store, generate `AXIS_REVIEW_SERVE_TOKEN` as above, set `AXIS_REVIEW_REF` to a published full 40-hex commit SHA, and set `PR_URLS` to a space-separated list of GitHub pull request URLs. The CLI encrypts the environment variables supplied with `-e`; see [Phala secure environment variables](https://docs.phala.com/phala-cloud/cvm/set-secure-environment-variables). Pass secrets through an env file rather than `KEY=VALUE` arguments, which would expose them in the local process list. If GitHub API access needs a token, add a `GITHUB_TOKEN` line to the same file.
 
 ```bash
 npm i -g phala
 phala login
+(umask 077; printf 'PHALA_API_KEY=%s\nAXIS_REVIEW_SERVE_TOKEN=%s\n' \
+  "$PHALA_API_KEY" "$AXIS_REVIEW_SERVE_TOKEN" > secrets.env)
 phala deploy -n axis-review -c docker-compose.yml -t tdx.small --disk-size 20G \
-  -e "PHALA_API_KEY=$PHALA_API_KEY" -e "AXIS_REVIEW_REF=$AXIS_REVIEW_REF" \
-  -e "AXIS_REVIEW_SERVE_TOKEN=$AXIS_REVIEW_SERVE_TOKEN" -e "PR_URLS=$PR_URLS" --wait
+  -e secrets.env -e "AXIS_REVIEW_REF=$AXIS_REVIEW_REF" -e "PR_URLS=$PR_URLS" --wait
+rm secrets.env
 phala cvms get axis-review
 phala cvms attestation axis-review
 ```
 
-The [Compose service](/docker-compose.yml) checks that the checkout matches the requested commit before and after installing it with the `tee` extra. It reads the Phala config from that checkout and writes results to `/data/out`. When review exits successfully, it binds to `0.0.0.0:8080` inside the container and requires the same token-prefixed paths as local serving. The token grants access to raw model payloads and PR material as well as reports. Use the CVM's HTTPS application endpoint for port `8080` to copy the results before deleting it. See [Phala port routing](https://docs.phala.com/phala-cloud/cvm/set-secure-environment-variables#special-environment-variables).
+The [Compose service](/docker-compose.yml) checks that the checkout matches the requested commit before and after installing it with the `tee` extra. It reads the Phala config from that checkout and writes results to `/data/out`. After review finishes, even if some PRs failed, it logs the review exit status and binds to `0.0.0.0:8080` inside the container and requires the same token-prefixed paths as local serving. The token grants access to raw model payloads and PR material as well as reports. Use the CVM's HTTPS application endpoint for port `8080` to copy the results before deleting it. See [Phala port routing](https://docs.phala.com/phala-cloud/cvm/set-secure-environment-variables#special-environment-variables).
 
 ```bash
 phala cvms delete axis-review

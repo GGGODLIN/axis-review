@@ -136,25 +136,29 @@ python() {
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
       executable = root / "axis-review"
-      executable.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TRACE"\n')
+      executable.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$TRACE"\n'
+                            '[[ "$1" != review ]] || exit "$STUB_REVIEW_STATUS"\n')
       executable.chmod(0o700)
       valid = "a" * 40
       mismatch = "b" * 40
-      for ref, head, installed_head, expected_status, expected_trace in (
-        ("main", valid, valid, 1, []),
-        ("a" * 39, valid, valid, 1, []),
-        ("g" * 40, valid, valid, 1, []),
-        (valid, mismatch, valid, 1, []),
-        (valid, valid, mismatch, 1, ["install"]),
-        (valid.upper(), valid, valid, 0, ["install", "review", "serve"]),
+      for ref, head, installed_head, review_status, expected_status, expected_trace in (
+        ("main", valid, valid, 0, 1, []),
+        ("a" * 39, valid, valid, 0, 1, []),
+        ("g" * 40, valid, valid, 0, 1, []),
+        (valid, mismatch, valid, 0, 1, []),
+        (valid, valid, mismatch, 0, 1, ["install"]),
+        (valid.upper(), valid, valid, 0, 0, ["install", "review", "serve"]),
+        (valid, valid, valid, 1, 0, ["install", "review", "serve"]),
       ):
-        with self.subTest(ref=ref, head_matches=ref.lower() == head, stable=head == installed_head):
+        with self.subTest(ref=ref, head_matches=ref.lower() == head, stable=head == installed_head,
+                          review_status=review_status):
           trace = root / "trace"
           trace.write_text("")
           result = subprocess.run(["/bin/bash", "-ec", stub + command], cwd=root, env={
             "PATH": f"{root}:/usr/bin:/bin", "PR_URLS": "https://github.com/owner/repo/pull/1",
             "AXIS_REVIEW_REF": ref, "AXIS_REVIEW_SERVE_TOKEN": TOKEN, "STUB_HEAD": head,
             "STUB_INSTALLED_HEAD": installed_head, "TRACE": str(trace),
+            "STUB_REVIEW_STATUS": str(review_status),
           }, capture_output=True, text=True, timeout=5)
           self.assertEqual(result.returncode, expected_status, result.stderr)
           lines = trace.read_text().splitlines()

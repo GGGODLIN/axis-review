@@ -2,5 +2,7 @@
 __pycache__/
 *.pyc
 out/
-.env
+.env*
+*.env
+!.env.example
 *.log
