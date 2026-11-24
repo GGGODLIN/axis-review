@@ -2,6 +2,7 @@ language = "en"
 
 [endpoints.magpie]
 base_url = "http://127.0.0.1:18417/v1"
+max_tokens = 32000
 
 [[axes]]
 id = "primary"

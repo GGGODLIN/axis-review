@@ -21,12 +21,13 @@ from urllib.request import Request, urlopen
 
 
 class ConfigTests(unittest.TestCase):
-  def config(self, *, endpoint="local", finder="finder", verifier="judge"):
+  def config(self, *, endpoint="local", finder="finder", verifier="judge", extra=""):
     with tempfile.TemporaryDirectory() as work:
       path = Path(work) / "config.toml"
       path.write_text(f'''
 [endpoints.local]
 base_url = "http://127.0.0.1/v1/"
+{extra}
 [[axes]]
 id = "neutral"
 endpoint = "{endpoint}"
@@ -50,6 +51,13 @@ for_diff_axes = {{endpoint = "local", model = "{verifier}"}}
   def test_same_model_verifier_rejected(self):
     with self.assertRaisesRegex(ValueError, "different models"):
       self.config(verifier="finder")
+
+  def test_endpoint_max_tokens_is_optional_and_positive(self):
+    self.assertIsNone(self.config().endpoints["local"].max_tokens)
+    self.assertEqual(self.config(extra="max_tokens = 32000").endpoints["local"].max_tokens, 32000)
+    for bad in ("0", "-1", '"32000"', "1.5"):
+      with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "max_tokens"):
+        self.config(extra=f"max_tokens = {bad}")
 
 
 class Server:
@@ -114,6 +122,29 @@ class TransportTests(unittest.TestCase):
         self.assertEqual((root / row["req_path"]).read_bytes(), sent)
         self.assertEqual((root / row["resp_path"]).read_bytes(), body)
         self.assertNotIn("headers", row)
+
+  def test_endpoint_max_tokens_is_sent_only_when_configured(self):
+    observed = []
+
+    class Handler(BaseHTTPRequestHandler):
+      def do_POST(self):
+        observed.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"id":"r","model":"m","choices":[]}')
+
+      def log_message(self, *args):
+        pass
+
+    with Server(Handler) as server:
+      config = Config({"capped": Endpoint(server.base + "/v1", max_tokens=32000),
+                       "default": Endpoint(server.base + "/v1")}, (), {})
+      client = Client(config, sleep=lambda seconds: None)
+      for name in ("capped", "default"):
+        client.chat(phase="initial", axis="neutral", endpoint=name, model="m",
+                    messages=[{"role": "user", "content": "x"}])
+    self.assertEqual(observed[0]["max_tokens"], 32000)
+    self.assertNotIn("max_tokens", observed[1])
 
   def test_rejects_artifact_containing_environment_credential(self):
     with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, {"TEST_AXIS_KEY": "synthetic-test-marker"}):

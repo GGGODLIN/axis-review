@@ -4,6 +4,7 @@ language = "en"
 base_url = "https://inference.phala.com/v1"
 api_key_env = "PHALA_API_KEY"
 receipts = "phala-aci"
+max_tokens = 32000
 
 [[axes]]
 id = "primary"

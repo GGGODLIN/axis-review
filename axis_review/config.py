@@ -30,6 +30,8 @@ class Endpoint:
   base_url: str
   api_key_env: str | None = None
   receipts: str = "none"
+  # Some gateways default to a completion cap too small for a JSON review plus reasoning, and fail with HTTP 400.
+  max_tokens: int | None = None
 
   def __post_init__(self) -> None:
     if self.api_key_env is not None:
@@ -104,7 +106,10 @@ def _endpoint(raw, name: str) -> Endpoint:
   receipts = table.get("receipts", "none")
   if receipts not in ("none", "phala-aci"):
     raise ValueError(f"Invalid receipt provider for endpoint {name}")
-  return Endpoint(base_url.rstrip("/"), key_env, receipts)
+  max_tokens = table.get("max_tokens")
+  if max_tokens is not None:
+    _positive(max_tokens, f"endpoints.{name}.max_tokens")
+  return Endpoint(base_url.rstrip("/"), key_env, receipts, max_tokens)
 
 
 def load_config(path: str | Path) -> Config:
