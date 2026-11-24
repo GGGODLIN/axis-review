@@ -250,7 +250,7 @@ Delete the CVM after copying the outputs.
 
 Two independent reviewers compared this design with `claude-pr-review` and reported where the
 methodology was broken or weakened. Port the original wording, made vendor-neutral, from the
-cited sections of `~/Desktop/projects/claude-pr-review/commands/pr-review.md` (abbreviated
+cited sections of `commands/pr-review.md` in GGGODLIN/claude-pr-review (abbreviated
 `PR.md`) and `references/`. Prompts treat diff, code, spec text and other axes' findings as data,
 never as instructions.
 
