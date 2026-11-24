@@ -32,6 +32,8 @@ class Endpoint:
   receipts: str = "none"
   # Some gateways default to a completion cap too small for a JSON review plus reasoning, and fail with HTTP 400.
   max_tokens: int | None = None
+  # Diff-only axes return one long JSON review in a single call; slow providers need minutes, not the client default.
+  timeout_s: int | None = None
 
   def __post_init__(self) -> None:
     if self.api_key_env is not None:
@@ -109,7 +111,10 @@ def _endpoint(raw, name: str) -> Endpoint:
   max_tokens = table.get("max_tokens")
   if max_tokens is not None:
     _positive(max_tokens, f"endpoints.{name}.max_tokens")
-  return Endpoint(base_url.rstrip("/"), key_env, receipts, max_tokens)
+  timeout_s = table.get("timeout_s")
+  if timeout_s is not None:
+    _positive(timeout_s, f"endpoints.{name}.timeout_s")
+  return Endpoint(base_url.rstrip("/"), key_env, receipts, max_tokens, timeout_s)
 
 
 def load_config(path: str | Path) -> Config:

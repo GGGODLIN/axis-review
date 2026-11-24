@@ -150,6 +150,7 @@ class Client:
       headers["Authorization"] = f"Bearer {key}"
     request = Request(f"{target.base_url}/chat/completions", data=payload, headers=headers)
     opener = build_opener(NoRedirect())
+    timeout = self.timeout if target.timeout_s is None else target.timeout_s
 
     for attempt in range(len(BACKOFF) + 1):
       with self._lock:
@@ -159,7 +160,7 @@ class Client:
       status, received_headers, response, transport_error = None, {}, b"", None
       try:
         try:
-          reply = opener.open(request, timeout=self.timeout)
+          reply = opener.open(request, timeout=timeout)
         except HTTPError as error:
           reply = error
         with reply:

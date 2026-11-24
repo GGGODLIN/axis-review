@@ -52,6 +52,13 @@ for_diff_axes = {{endpoint = "local", model = "{verifier}"}}
     with self.assertRaisesRegex(ValueError, "different models"):
       self.config(verifier="finder")
 
+  def test_endpoint_timeout_is_optional_and_positive(self):
+    self.assertIsNone(self.config().endpoints["local"].timeout_s)
+    self.assertEqual(self.config(extra="timeout_s = 900").endpoints["local"].timeout_s, 900)
+    for bad in ("0", "-1", "1.5", '"900"', "true"):
+      with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "timeout_s"):
+        self.config(extra=f"timeout_s = {bad}")
+
   def test_endpoint_max_tokens_is_optional_and_positive(self):
     self.assertIsNone(self.config().endpoints["local"].max_tokens)
     self.assertEqual(self.config(extra="max_tokens = 32000").endpoints["local"].max_tokens, 32000)
@@ -145,6 +152,36 @@ class TransportTests(unittest.TestCase):
                     messages=[{"role": "user", "content": "x"}])
     self.assertEqual(observed[0]["max_tokens"], 32000)
     self.assertNotIn("max_tokens", observed[1])
+
+  def test_endpoint_timeout_overrides_client_default(self):
+    seen = []
+
+    class Reply:
+      code = 200
+      headers = {}
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        return False
+
+      def read(self):
+        return b'{"id":"r","model":"m","choices":[]}'
+
+    class Opener:
+      def open(self, request, timeout):
+        seen.append(timeout)
+        return Reply()
+
+    config = Config({"slow": Endpoint("http://127.0.0.1/v1", timeout_s=900),
+                     "default": Endpoint("http://127.0.0.1/v1")}, (), {})
+    with patch("axis_review.llm.build_opener", return_value=Opener()):
+      client = Client(config, sleep=lambda seconds: None)
+      for name in ("slow", "default"):
+        client.chat(phase="initial", axis="neutral", endpoint=name, model="m",
+                    messages=[{"role": "user", "content": "x"}])
+    self.assertEqual(seen, [900, 120])
 
   def test_rejects_artifact_containing_environment_credential(self):
     with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, {"TEST_AXIS_KEY": "synthetic-test-marker"}):
