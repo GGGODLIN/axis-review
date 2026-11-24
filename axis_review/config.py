@@ -2,6 +2,7 @@ import json
 import os
 import tomllib
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -9,11 +10,30 @@ from urllib.parse import urlsplit
 AXIS_IDS = ("primary", "neutral", "adversarial")
 
 
+def require_credential_transport(base_url: str) -> None:
+  url = urlsplit(base_url)
+  if url.scheme == "https":
+    return
+  if url.scheme == "http" and url.hostname:
+    if url.hostname == "localhost":
+      return
+    try:
+      if ip_address(url.hostname).is_loopback:
+        return
+    except ValueError:
+      pass
+  raise ValueError("Endpoints with API credentials require HTTPS unless the host is loopback")
+
+
 @dataclass(frozen=True)
 class Endpoint:
   base_url: str
   api_key_env: str | None = None
   receipts: str = "none"
+
+  def __post_init__(self) -> None:
+    if self.api_key_env is not None:
+      require_credential_transport(self.base_url)
 
   def api_key(self) -> str | None:
     if self.api_key_env is None:

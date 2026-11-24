@@ -15,7 +15,7 @@ import rfc8785
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from .config import Config, ensure_no_credentials
+from .config import Config, ensure_no_credentials, require_credential_transport
 
 
 NOT_VERIFIED = (
@@ -25,6 +25,7 @@ NOT_VERIFIED = (
 )
 CHECKS = (
   "receipt",
+  "identity",
   "keyset_digest",
   "keyset_expiry",
   "signing_key",
@@ -59,6 +60,7 @@ def _decode_object(raw: bytes) -> dict:
 def _get_json(opener, url: str, api_key: str | None, validate_bytes) -> dict | None:
   headers = {"Accept": "application/json"}
   if api_key is not None:
+    require_credential_transport(url)
     headers["Authorization"] = f"Bearer {api_key}"
   for attempt in range(3):
     try:
@@ -100,6 +102,14 @@ def _successful_calls(out_dir: Path):
           yield call
 
 
+def _receipt_lookup(call: dict) -> tuple[str, str | None]:
+  for call_field, signed_field in (("receipt_id", "receipt_id"), ("response_id", "chat_id")):
+    value = call.get(call_field)
+    if isinstance(value, str) and value:
+      return signed_field, value
+  return "receipt_id", None
+
+
 def process(out_dir: Path, endpoints: dict[str, dict], *, config: Config | None = None) -> dict:
   """Fetch artifacts with the inference credential and then verify them offline."""
   receipts_dir = out_dir / "receipts"
@@ -113,8 +123,8 @@ def process(out_dir: Path, endpoints: dict[str, dict], *, config: Config | None 
   for call in _successful_calls(out_dir):
     if call["endpoint"] not in endpoints:
       continue
-    receipt_id = call.get("receipt_id") or call.get("response_id")
-    if not receipt_id:
+    _, receipt_id = _receipt_lookup(call)
+    if receipt_id is None:
       continue
     target = endpoints[call["endpoint"]]
     base_url = target["base_url"].rstrip("/")
@@ -128,10 +138,11 @@ def process(out_dir: Path, endpoints: dict[str, dict], *, config: Config | None 
     base_url = target["base_url"].rstrip("/")
     report = _get_json(opener, f"{base_url}/aci/attestation?nonce={nonce}", target["api_key"], validate_bytes)
     if report is None:
-      # Keep the endpoint in scope when both attestation and receipt retrieval fail.
       report = {"fetch_error": True}
     _write_json(_attestation_path(receipts_dir, endpoint), {**report, "nonce": nonce})
-  return verify(out_dir)
+  summary = _verify(out_dir, endpoints=set(endpoints))
+  _write_json(receipts_dir / "verification.json", summary)
+  return summary
 
 
 def _read_object(path: Path) -> tuple[dict | None, str]:
@@ -211,6 +222,8 @@ def _body_hash_status(root: Path, path, event: dict) -> str:
 def _check_receipt(root: Path, call: dict, receipt: dict, report: dict | None, now: float) -> dict:
   checks = dict.fromkeys(CHECKS, "unavailable")
   checks["receipt"] = "pass"
+  signed_field, expected_id = _receipt_lookup(call)
+  checks["identity"] = _status(expected_id is not None and receipt.get(signed_field) == expected_id)
   keyset = _object(_object(_object(report).get("attestation")).get("workload_keyset"))
   if keyset:
     checks["keyset_digest"] = _keyset_digest_status(report, keyset, receipt)
@@ -231,19 +244,30 @@ def _check_receipt(root: Path, call: dict, receipt: dict, report: dict | None, n
 
 
 def verify(out_dir: Path) -> dict:
-  """Check saved artifacts without networking or trusting the gateway quote."""
+  """Check saved artifacts without writing, networking, or trusting the gateway quote."""
+  return _verify(out_dir)
+
+
+def _verify(out_dir: Path, endpoints: set[str] | None = None) -> dict:
   root = out_dir.resolve()
   receipts_dir = root / "receipts"
-  receipts_dir.mkdir(exist_ok=True)
   counts = {check: dict.fromkeys(STATUSES, 0) for check in CHECKS}
   rows = []
   verified = 0
   now = time.time()
   for call in _successful_calls(root):
     seq, endpoint = call["seq"], call["endpoint"]
+    expected = call.get("receipt_expected")
+    if "receipt_expected" in call and type(expected) is not bool:
+      raise ValueError("receipt_expected must be a boolean")
+    if expected is None and endpoints is not None:
+      expected = endpoint in endpoints
+    if expected is False:
+      continue
     receipt, receipt_status = _read_object(receipts_dir / f"{seq}.json")
     attestation_path = _attestation_path(receipts_dir, endpoint)
-    if receipt_status == "missing" and not attestation_path.exists():
+    if expected is None and receipt_status == "missing" and not attestation_path.exists():
+      # Older bundles did not record which endpoints expected receipts.
       continue
     if receipt is None:
       checks = {**dict.fromkeys(CHECKS, "unavailable"), "receipt": receipt_status}
@@ -254,12 +278,12 @@ def verify(out_dir: Path) -> dict:
       counts[check][status] += 1
     verified += all(status == "pass" for status in checks.values())
     rows.append({"seq": seq, "endpoint": endpoint, "checks": checks})
-  summary = {
+  return {
+    "expected": len(rows),
     "fetched": counts["receipt"]["pass"],
     "verified": verified,
+    "missing": counts["receipt"]["missing"],
     "checks": counts,
     "receipts": rows,
     "not_verified": list(NOT_VERIFIED),
   }
-  _write_json(receipts_dir / "verification.json", summary)
-  return summary

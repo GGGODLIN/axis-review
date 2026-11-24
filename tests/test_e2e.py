@@ -1,10 +1,12 @@
 import hashlib
+import io
 import json
 import tempfile
 import threading
 import time
 import unittest
 from collections import Counter
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -14,12 +16,16 @@ import rfc8785
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from axis_review import github, receipts, tee_quote
+from axis_review import cli, github, receipts, tee_quote
 from axis_review.config import Axis, Config, Endpoint, Model
 from axis_review.review import run_review
 
 
-SOURCE = "default = 'café'\npassword_check = 'legacy'\nretry_count = 3\nlabel = 'Ready'\n"
+SOURCE = ("default = 'café'\npassword_check = 'legacy'\nretry_count = 3\nlabel = 'Ready'\n"
+          "notifications_enabled = False\n")
+BASE_SOURCE = SOURCE.replace("retry_count = 3", "retry_count = 1").replace(
+  "notifications_enabled = False", "notifications_enabled = True",
+)
 FILES = {"src.py": SOURCE, "docs/scope.md": "# Scope\n\nReview the settings change.\n",
          "generated/table.txt": "Generated table\n"}
 DESCRIPTION = "Review the settings change.\n\nKeep the display label.\n"
@@ -34,18 +40,25 @@ def fixture_pr(root):
 
   root.mkdir()
   git("init", "--quiet", "--template=")
-  base = git("commit-tree", git("write-tree"), "-m", "Empty base")
+  (root / "src.py").write_text(BASE_SOURCE, encoding="utf-8")
+  git("add", "src.py")
+  base = git("commit-tree", git("write-tree"), "-m", "Prior settings")
+  (root / "src.py").write_text(SOURCE, encoding="utf-8")
+  git("add", "src.py")
+  middle = git("commit-tree", git("write-tree"), "-p", base, "-m", "Update settings")
   for path, text in FILES.items():
     target = root / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
   git("add", "--", *FILES)
-  head = git("commit-tree", git("write-tree"), "-p", base, "-m", "Update settings")
+  head = git("commit-tree", git("write-tree"), "-p", middle, "-m", "Document settings")
   git("update-ref", "HEAD", head)
-  files = [github.ChangedFile(path, "added", len(text.splitlines()), 0, git("diff", base, head, "--", path))
-           for path, text in FILES.items()]
+  files = [github.ChangedFile(path, "modified" if path == "src.py" else "added", additions, deletions,
+                            git("diff", base, head, "--", path))
+           for path, additions, deletions in (("src.py", 2, 2), ("docs/scope.md", 3, 0), ("generated/table.txt", 1, 0))]
   return github.PR("fixture", "settings", 7, "Settings revision", "fixture", base, head, files,
-                   DESCRIPTION, ({"sha": head, "message": "Update settings"},))
+                   DESCRIPTION, ({"sha": middle, "message": "Update settings"},
+                                 {"sha": head, "message": "Document settings"}))
 
 
 def finding(title, line, problem, *, category=None):
@@ -60,7 +73,8 @@ def finding(title, line, problem, *, category=None):
 def verdict(item, status, evidence):
   return {"finding_id": item["id"], "verdict": status, "evidence": evidence, "queries": ["settings"],
           "corrected_severity": None, "severity_reason": "Original severity retained.", "scope_quote": None,
-          "repro_path": None, "ships_breakage": False, "hypothetical": False, "fix_is_local": False,
+          "scope_source": None, "scope_explanation": None, "confirmed_claim": None,
+          "repro_path": None, "repro_path_verified": False, "ships_breakage": False, "hypothetical": False, "fix_is_local": False,
           "unverified_premises": [], "blind_spot_explanation": None, "security_facts": None,
           "security_matrix_severity": None}
 
@@ -79,13 +93,15 @@ def scripted_message(request):
       return tool_request("read_file", {"path": "src.py", "start_line": 1, "end_line": 1})
     output = {"findings": [finding("Default changed unexpectedly", 1, "The default is empty."),
                            finding("Legacy credential check", 2, "The fixture categorizes this check as plaintext.",
-                                   category="plaintext_password_compare")],
+                                   category="plaintext_password_compare"),
+                           finding("Notifications disabled by default", 5, "The default disables notifications.")],
               "coverage": [{"file": "docs/scope.md", "status": "REVIEWED_NO_ISSUES", "reason": None},
                            {"file": "generated/table.txt", "status": "INTENTIONALLY_SKIPPED",
                             "reason": "Generated output"}]}
   elif role == "neutral":
     output = {"findings": [finding("Retry setting is unsupported", 3, "The configured retry count lacks support."),
-                           finding("Label spelling differs", 4, "The displayed label differs from its specification.")]}
+                           finding("Label spelling differs", 4, "The displayed label differs from its specification."),
+                           finding("Notifications disabled by default", 5, "The change turns notifications off.")]}
   elif role == "adversarial":
     output = {"findings": []}
   elif role == "primary-verifier":
@@ -93,12 +109,36 @@ def scripted_message(request):
       return tool_request("grep", {"pattern": "default", "glob": "*.py"})
     output = {"verdicts": [verdict(data["findings"][0], "REFUTED", "src.py:1 contains a nonempty default.")]}
   elif role == "diff-verifier":
-    item, = data["findings"]
-    if item["line_start"] == 3:
-      if len(messages) == 2:
-        return tool_request("read_file", {"path": "src.py", "start_line": 3, "end_line": 3})
-      return {"content": "{malformed final JSON"}
-    output = {"verdicts": [verdict(item, "PARTIAL", "src.py:4 defines the label for one code path.")]}
+    if "Partition the supplied findings" in messages[0]["content"]:
+      groups = {}
+      for item in data["findings"]:
+        groups.setdefault(item["root_cause"], []).append(item["id"])
+      output = {"groups": list(groups.values())}
+    elif "groups" in data:
+      group, = data["groups"]
+      output = {"baselines": [{
+        "group_id": group["group_id"], "convention": "conflicts", "scope": "in-scope",
+        "evidence": "src.py:5 disables notifications by default.", "queries": ["notifications_enabled"],
+        "scope_quote": None, "scope_source": None, "scope_explanation": None, "unverified_premises": [],
+        "repro_path": "Start with default settings and check notifications.", "repro_path_verified": True,
+        "ships_breakage": True, "hypothetical": False, "fix_is_local": True,
+        "corrected_severity": None, "severity_reason": "Original severity retained.",
+        "security_facts": None, "security_matrix_severity": None,
+      }]}
+    else:
+      item, = data["findings"]
+      if item["line_start"] == 3:
+        if len(messages) == 2:
+          return tool_request("read_file", {"path": "src.py", "ref": "base", "start_line": 3, "end_line": 3})
+        if messages[-1]["tool_call_id"] == "call-read_file":
+          return tool_request("pr_commits", {"path": "src.py"})
+        if messages[-1]["tool_call_id"] == "call-pr_commits":
+          sha = messages[-1]["content"].splitlines()[0]
+          return tool_request("show_commit_patch", {"sha": sha, "path": "src.py"})
+        return {"content": "{malformed final JSON"}
+      proof = verdict(item, "PARTIAL", "src.py:4 defines the label for one code path.")
+      proof["confirmed_claim"] = "The alternate settings view is the only view with the label mismatch."
+      output = {"verdicts": [proof]}
   else:
     raise AssertionError("Unexpected model role")
   return {"content": json.dumps(output, ensure_ascii=False)}
@@ -108,7 +148,7 @@ def digest(data):
   return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def provider_handler(calls, attestations):
+def provider_handler(calls, attestations, message_for=scripted_message):
   signing_key = Ed25519PrivateKey.generate()
   keyset = {"not_after": int(time.time()) + 3600, "receipt_signing_keys": [
     {"key_id": "fixture", "algo": "ed25519",
@@ -136,7 +176,7 @@ def provider_handler(calls, attestations):
         return
       request_bytes = self.rfile.read(int(self.headers["Content-Length"]))
       request = json.loads(request_bytes)
-      message = scripted_message(request)
+      message = message_for(request)
       with lock:
         response_id = f"chat-{len(calls) + 1}"
         receipt_id = f"receipt-{response_id}"
@@ -153,7 +193,8 @@ def provider_handler(calls, attestations):
         payload = {"workload_keyset_digest": keyset_digest, "attestation": {"workload_keyset": keyset}}
       elif url.path.startswith("/v1/aci/receipts/") and url.path.rsplit("/", 1)[1] in calls:
         request, response = calls[url.path.rsplit("/", 1)[1]]
-        payload = {"key_id": "fixture", "workload_keyset_digest": keyset_digest, "event_log": [
+        payload = {"receipt_id": url.path.rsplit("/", 1)[1], "key_id": "fixture",
+                   "workload_keyset_digest": keyset_digest, "event_log": [
           {"type": "request.received", "body_hash": digest(request)},
           {"type": "response.returned", "body_hash": digest(response)},
           {"type": "upstream.verified", "result": "verified", "required": True},
@@ -198,6 +239,8 @@ class EndToEndTests(unittest.TestCase):
       self.assertEqual(checkout.call_args.args[0], pr)
       versions.assert_called_once_with(pr)
       self.assertEqual(result.out_dir, out)
+      self.assertFalse(result.review_failed)
+      self.assertIsNone(result.failure_reason)
       evidence = json.loads((out / "evidence.json").read_bytes())
       text = (out / "report.md").read_text(encoding="utf-8")
       headers = [line for line in text.splitlines() if line.startswith("## ")]
@@ -221,7 +264,8 @@ class EndToEndTests(unittest.TestCase):
       sections = dict((heading.splitlines()[0], heading) for heading in text.split("\n## ")[1:])
       by_title = {row["title"]: row for row in evidence["findings"]}
       self.assertEqual(set(by_title), {"Default changed unexpectedly", "Legacy credential check",
-                                      "Retry setting is unsupported", "Label spelling differs"})
+                                      "Retry setting is unsupported", "Label spelling differs",
+                                      "Notifications disabled by default"})
       for row in by_title.values():
         self.assertEqual([bucket for bucket in BUCKETS if f"UID `{row['uid']}`" in sections[bucket]], [row["bucket"]])
       self.assertIn("REFUTED", sections["Reference"])
@@ -233,9 +277,18 @@ class EndToEndTests(unittest.TestCase):
       self.assertEqual(strict["verification_status"], "SKIPPED (strict-liability passthrough)")
       self.assertNotIn(strict["id"], evidence["verification"])
       self.assertIn("SKIPPED", sections["Must Fix"])
+      consensus = by_title["Notifications disabled by default"]
+      self.assertEqual(consensus["bucket"], "Must Fix")
+      self.assertEqual(set(consensus["axis_hits"]), {"primary", "neutral"})
+      self.assertIs(evidence["baselines"][consensus["group_id"]]["repro_path_verified"], True)
+      self.assertIn("Failure path Start with default settings and check notifications", sections["Must Fix"])
       failed = by_title["Retry setting is unsupported"]
       self.assertEqual(failed["verdict"], "INCONCLUSIVE")
       self.assertEqual(by_title["Label spelling differs"]["verdict"], "PARTIAL")
+      detail = sections["Should Fix"].split(f"UID `{by_title['Label spelling differs']['uid']}`", 1)[1]
+      comment = detail.split("```text", 1)[1].split("```", 1)[0]
+      self.assertIn("The alternate settings view is the only view with the label mismatch.", comment)
+      self.assertNotIn("The displayed label differs from its specification.", comment)
       batch, = [row for row in evidence["verification_batches"] if failed["id"] in row["ids"]]
       self.assertEqual((batch["state"], batch["error"]), ("FAILED", "Final message is malformed JSON"))
       self.assertIn(batch["error"], sections["Limits and self-check"])
@@ -252,18 +305,75 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue({"request_bytes", "response_bytes"}.isdisjoint(row))
         self.assertEqual(row["model_observed"], json.loads(resp)["model"])
       requests = [json.loads(req) for req, _ in calls.values()]
-      tool_results = {req["model"]: req["messages"][-1]["content"] for req in requests
-                      if req["messages"][-1]["role"] == "tool"}
-      self.assertEqual(tool_results, {
-        "primary": "1: default = 'café'", "primary-verifier": "src.py:1: default = 'café'",
-        "diff-verifier": "3: retry_count = 3",
+      tool_results = {(req["model"], req["messages"][-1]["tool_call_id"]): req["messages"][-1]["content"]
+                      for req in requests if req["messages"][-1]["role"] == "tool"}
+      self.assertEqual(set(tool_results), {
+        ("primary", "call-read_file"), ("primary-verifier", "call-grep"),
+        ("diff-verifier", "call-read_file"), ("diff-verifier", "call-pr_commits"),
+        ("diff-verifier", "call-show_commit_patch"),
       })
+      self.assertEqual(tool_results["primary", "call-read_file"], "1: default = 'café'")
+      self.assertEqual(tool_results["primary-verifier", "call-grep"], "src.py:1: default = 'café'")
+      self.assertEqual(tool_results["diff-verifier", "call-read_file"], "3: retry_count = 1")
+      middle = pr.commit_messages[0]["sha"]
+      self.assertEqual(tool_results["diff-verifier", "call-pr_commits"], f"{middle}\nUpdate settings")
+      commit_patch = tool_results["diff-verifier", "call-show_commit_patch"]
+      self.assertEqual(commit_patch, next(file.patch for file in pr.files if file.path == "src.py") + "\n")
       failed_requests = [req for req in requests if req["model"] == "diff-verifier" and
-                         json.loads(req["messages"][1]["content"])["findings"][0]["id"] == failed["id"]]
-      self.assertEqual([req["messages"][-1]["role"] for req in failed_requests], ["user", "tool"])
+                         [item["id"] for item in json.loads(req["messages"][1]["content"]).get("findings", [])]
+                         == [failed["id"]]]
+      self.assertEqual([req["messages"][-1]["role"] for req in failed_requests], ["user", "tool", "tool", "tool"])
 
       nonce, = attestations
       self.assertEqual(json.loads((out / "receipts/attestation-local.json").read_bytes())["nonce"], nonce)
-      self.assertEqual((evidence["receipts"]["fetched"], evidence["receipts"]["verified"]), (len(rows), len(rows)))
-      self.assertEqual(receipts.verify(out), evidence["receipts"])
+      summary = evidence["receipts"]
+      self.assertEqual(tuple(summary[key] for key in ("expected", "fetched", "verified", "missing")),
+                       (len(rows), len(rows), len(rows), 0))
+      self.assertIn(f"Expected {len(rows)} · Fetched {len(rows)} · Verified {len(rows)} · Missing 0",
+                    sections["Receipts and application quote"])
+      self.assertEqual(summary["checks"]["identity"]["pass"], len(rows))
+      self.assertEqual(receipts.verify(out), summary)
       self.assertEqual(json.loads((out / "tee_quote.json").read_bytes()), {"in_tee": False})
+
+  def test_review_cli_exits_nonzero_after_publishing_failed_report(self):
+    def malformed_reply(_):
+      return {"content": "{malformed initial JSON"}
+
+    with (tempfile.TemporaryDirectory() as temporary,
+          ThreadingHTTPServer(("127.0.0.1", 0), provider_handler({}, [], malformed_reply)) as server):
+      work = Path(temporary)
+      root = work / "checkout"
+      pr = fixture_pr(root)
+      config = work / "review.toml"
+      config.write_text(f'''[endpoints.local]
+base_url = "http://127.0.0.1:{server.server_port}/v1"
+[[axes]]
+id = "primary"
+endpoint = "local"
+model = "primary"
+[verifiers]
+for_primary = {{endpoint = "local", model = "primary-verifier"}}
+''', encoding="utf-8")
+      thread = threading.Thread(target=server.serve_forever)
+      thread.start()
+      try:
+        with (patch.object(github, "fetch_pr", return_value=pr),
+              patch.object(github, "checkout", return_value=root),
+              patch.object(github, "fetch_versions", return_value=(pr.base_sha, pr.head_sha)),
+              patch.object(tee_quote, "DSTACK_SOCKET", work / "absent.sock"),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+          status = cli.main(["review", pr.url, "--config", str(config), "--out", str(work / "output")])
+      finally:
+        server.shutdown()
+        thread.join()
+
+      self.assertEqual(status, 1)
+      report_path = work / "output" / "fixture--settings--pr-7" / "report.md"
+      self.assertEqual(output.getvalue().splitlines(), [str(report_path)])
+      evidence = json.loads(report_path.with_name("evidence.json").read_bytes())
+      reason = "No initial axis produced a usable reply after repair."
+      self.assertIs(evidence["review_failed"], True)
+      self.assertEqual(evidence["failure_reason"], reason)
+      self.assertEqual(Counter(call["phase"] for call in evidence["calls"]), {"initial": 2, "coverage_repair": 2})
+      self.assertIn(f"**Review failed.** {reason.removesuffix('.')}", report_path.read_text(encoding="utf-8"))
+      self.assertEqual(errors.getvalue().splitlines(), [f"fixture/settings#7: {reason}"])

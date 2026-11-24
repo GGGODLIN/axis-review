@@ -3,8 +3,9 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, replace
+from http.client import HTTPException
 from pathlib import Path
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.request import Request, build_opener
 
 from .llm import NoRedirect
@@ -70,7 +71,7 @@ def _api(path: str, accept: str = "application/vnd.github+json") -> bytes:
   except HTTPError as error:
     with error:
       raise GitHubError(f"GitHub returned HTTP {error.code}") from None
-  except OSError as error:
+  except (OSError, HTTPException) as error:
     raise GitHubError(f"GitHub request failed ({type(error).__name__})") from None
 
 
@@ -220,18 +221,55 @@ def checkout(pr: PR, workdir: Path) -> Path:
 
     credentials = b64encode(f"x-access-token:{token}".encode()).decode()
     config["http.https://github.com/.extraHeader"] = f"Authorization: Basic {credentials}"
+  fetch = ["fetch", "--quiet", "--no-tags", "--", remote]
+  # A shallow boundary can omit the commits that changed individual lines in the PR.
   try:
-    _git(["fetch", "--quiet", "--depth=1", "--no-tags", remote, pr.head_sha], root, config)
+    _git([*fetch, pr.head_sha], root, config)
   except GitHubError:
-    _git(["fetch", "--quiet", "--depth=1", "--no-tags", remote,
-          f"refs/pull/{pr.number}/head"], root, config)
+    _git([*fetch, f"refs/pull/{pr.number}/head"], root, config)
   if _git(["rev-parse", "FETCH_HEAD"], root).decode().strip() != pr.head_sha:
     raise GitHubError("Fetched PR head does not match the captured head SHA")
+  _git([*fetch, pr.base_sha], root, config)
+  if _git(["rev-parse", "FETCH_HEAD"], root).decode().strip() != pr.base_sha:
+    raise GitHubError("Fetched PR base does not match the captured base SHA")
   _git(["-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", pr.head_sha], root)
   if _git(["rev-parse", "HEAD"], root).decode().strip() != pr.head_sha:
     raise GitHubError("Checkout HEAD does not match the captured head SHA")
   return root
 
 
-def tracked_paths(root: Path) -> list[str]:
-  return sorted(os.fsdecode(path) for path in _git(["ls-files", "-z"], root).split(b"\0") if path)
+def tracked_paths(root: Path, sha: str, path: str | None = None) -> list[str]:
+  if not _SHA.fullmatch(sha):
+    raise GitHubError("A pinned commit SHA is required")
+  args = ["--literal-pathspecs", "ls-tree", "-rz", sha, "--"]
+  if path is not None:
+    args.append(path)
+  entries = _git(args, root).split(b"\0")
+  return sorted(os.fsdecode(entry.split(b"\t", 1)[1]) for entry in entries
+                if entry.startswith((b"100644 blob ", b"100755 blob ")))
+
+
+def read_blob(root: Path, sha: str, path: str) -> bytes:
+  if path not in tracked_paths(root, sha, path):
+    raise GitHubError("Path is not a regular file at the selected commit")
+  return _git(["show", f"{sha}:{path}"], root)
+
+
+def _pr_range(base: str, head: str) -> str:
+  if not all(_SHA.fullmatch(sha) for sha in (base, head)):
+    raise GitHubError("Pinned base and head commits are required")
+  return f"{base}..{head}"
+
+
+def pr_history(root: Path, base: str, head: str, path: str) -> list[tuple[str, str]]:
+  args = ["--literal-pathspecs", "log", _pr_range(base, head), "-z", "--format=%H%x00%B",
+          "--full-history", "--", path]
+  fields = _git(args, root).decode("utf-8", errors="replace").split("\0")
+  return list(zip(fields[:-1:2], fields[1::2]))
+
+
+def pr_commit_patch(root: Path, base: str, head: str, sha: str, path: str) -> bytes:
+  if not _SHA.fullmatch(sha) or sha.encode() not in _git(["rev-list", _pr_range(base, head), "--"], root).splitlines():
+    raise GitHubError("Commit SHA is outside the pinned PR range")
+  return _git(["--literal-pathspecs", "show", "--format=", "--no-ext-diff", "--no-textconv",
+               "--diff-merges=first-parent", sha, "--", path], root)

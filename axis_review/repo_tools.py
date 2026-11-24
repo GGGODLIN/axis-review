@@ -2,6 +2,8 @@ import fnmatch
 import os
 from pathlib import Path
 
+from . import github
+
 
 OUTPUT_LIMIT = 12_000
 TRUNCATED = "\n[output truncated]"
@@ -16,20 +18,30 @@ def _tool(name: str, description: str, properties: dict, required: list[str]) ->
 _TEXT = {"type": "string"}
 _POSITIVE = {"type": "integer", "minimum": 1}
 TOOLS = [
-  _tool("read_file", "Read numbered lines from a checkout-relative text file (inclusive, 1-based).",
-        {"path": _TEXT, "start_line": _POSITIVE, "end_line": _POSITIVE}, ["path"]),
+  _tool("read_file", "Read numbered lines from a pinned PR file (inclusive, 1-based).",
+        {"path": _TEXT, "start_line": _POSITIVE, "end_line": _POSITIVE,
+         "ref": {"type": "string", "enum": ["head", "base"], "default": "head"}}, ["path"]),
+  _tool("pr_commits", "List commits in the pinned PR range that touched a path, with messages.",
+        {"path": _TEXT}, ["path"]),
+  _tool("show_commit_patch", "Read a path's patch from a full commit SHA in the pinned PR range.",
+        {"sha": _TEXT, "path": _TEXT}, ["sha", "path"]),
   _tool("grep", "Search for a case-sensitive literal substring in checkout text files.",
         {"pattern": _TEXT, "glob": _TEXT, "max_results": _POSITIVE}, ["pattern"]),
   _tool("list_dir", "List a checkout-relative directory. Use . for the root.", {"path": _TEXT}, []),
 ]
 
 
-def confined(root: Path, raw: str) -> Path:
+def _relative_path(raw: str) -> Path:
   if not isinstance(raw, str) or not raw or "\x00" in raw:
     raise ValueError("Expected a non-empty checkout-relative path")
   path = Path(raw)
   if path.is_absolute() or ".." in path.parts or any(part.casefold() == ".git" for part in path.parts):
     raise ValueError("Path is outside the allowed checkout tree")
+  return path
+
+
+def confined(root: Path, raw: str) -> Path:
+  path = _relative_path(raw)
   root = root.resolve()
   try:
     resolved = (root / path).resolve(strict=True)
@@ -47,19 +59,31 @@ def matches_glob(path: str, pattern: str) -> bool:
   )
 
 
-def _read(path: Path, start_line: int = 1, end_line: int | None = None):
+def git_lines(text: str) -> list[str]:
+  return text.replace("\r\n", "\n").removesuffix("\n").split("\n") if text else []
+
+
+def _numbered(lines, start_line, end_line):
   if type(start_line) is not int or start_line < 1:
     raise ValueError("start_line must be a positive integer")
   if end_line is not None and (type(end_line) is not int or end_line < start_line):
     raise ValueError("end_line must be an integer at or after start_line")
-  if not path.is_file():
-    raise ValueError("Path is not a regular file")
-  with path.open(encoding="utf-8", errors="replace") as file:
-    for index, line in enumerate(file, 1):
-      if end_line is not None and index > end_line:
-        break
-      if index >= start_line:
-        yield f"{index}: {line.rstrip(chr(10))}"
+  for index, line in enumerate(lines, 1):
+    if end_line is not None and index > end_line:
+      break
+    if index >= start_line:
+      yield f"{index}: {line}"
+
+
+def _read(root, path, base_sha, head_sha, start_line=1, end_line=None, ref="head"):
+  if ref not in ("head", "base"):
+    raise ValueError("ref must be head or base")
+  relative = _relative_path(path).as_posix()
+  sha = head_sha if ref == "head" else base_sha
+  if sha is None:
+    raise ValueError(f"Pinned {ref} commit is unavailable")
+  text = github.read_blob(root, sha, relative).decode("utf-8", errors="replace")
+  yield from _numbered(git_lines(text), start_line, end_line)
 
 
 def _grep(root: Path, pattern: str, glob: str = "*", max_results: int = 100):
@@ -116,13 +140,25 @@ def _limited(lines) -> str:
   return output
 
 
-def execute(name: str, args: dict, root: Path) -> str:
+def execute(name: str, args: dict, root: Path, *, base_sha=None, head_sha=None) -> str:
   root = root.resolve()
   try:
     if name == "read_file":
-      params = dict(args)
-      path = confined(root, params.pop("path"))
-      return _limited(_read(path, **params))
+      return _limited(_read(root, base_sha=base_sha, head_sha=head_sha, **args))
+    if name in {"pr_commits", "show_commit_patch"}:
+      expected = {"path"} if name == "pr_commits" else {"path", "sha"}
+      if args.keys() != expected:
+        raise TypeError
+      if base_sha is None or head_sha is None:
+        raise ValueError("PR commit range is unavailable")
+      path = _relative_path(args["path"])
+      if not path.parts:
+        raise ValueError("A file path is required")
+      if name == "pr_commits":
+        return _limited(f"{sha}\n{message.rstrip(chr(10))}" for sha, message in
+                        github.pr_history(root, base_sha, head_sha, path.as_posix()))
+      patch = github.pr_commit_patch(root, base_sha, head_sha, args["sha"], path.as_posix())
+      return _limited((patch.decode("utf-8", errors="replace"),))
     if name == "grep":
       return _limited(_grep(root, **args))
     if name == "list_dir":
@@ -130,7 +166,7 @@ def execute(name: str, args: dict, root: Path) -> str:
     return "Tool error: unknown tool"
   except (KeyError, TypeError):
     return "Tool error: arguments do not match the tool schema"
-  except ValueError as error:
+  except (ValueError, github.GitHubError) as error:
     return f"Tool error: {error}"
   except OSError as error:
     return f"Tool error: {error.strerror or type(error).__name__}"

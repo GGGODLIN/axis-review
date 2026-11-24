@@ -52,14 +52,16 @@ PRIMARY_SCHEMA = object_schema({
                                   "reason": nullable(TEXT)})),
 })
 MATCH_SCHEMA = object_schema({"groups": array({**array(TEXT), "minItems": 1})})
-GATE_FIELDS = {"repro_path": nullable(TEXT), "ships_breakage": BOOL, "hypothetical": BOOL,
-               "fix_is_local": BOOL}
+GATE_FIELDS = {"repro_path": nullable(TEXT), "repro_path_verified": BOOL, "ships_breakage": BOOL,
+               "hypothetical": BOOL, "fix_is_local": BOOL}
 EVIDENCE_FIELDS = {"evidence": TEXT, "queries": array(TEXT), "scope_quote": nullable(TEXT),
+                   "scope_source": nullable(TEXT), "scope_explanation": nullable(TEXT),
                    "unverified_premises": array(TEXT)}
 VERIFY_SCHEMA = object_schema({"verdicts": array(object_schema({
   "finding_id": TEXT, "verdict": choices(VERDICTS),
   "corrected_severity": nullable(choices(SEVERITIES)), "severity_reason": TEXT,
   **EVIDENCE_FIELDS, **GATE_FIELDS, "blind_spot_explanation": nullable(TEXT),
+  "confirmed_claim": nullable(TEXT),
   "security_facts": nullable(SECURITY_FACTS),
   "security_matrix_severity": nullable(choices(SEVERITIES)),
 }))})
@@ -87,13 +89,17 @@ _NEUTRAL = """Independently read the diff as a reviewer reading a PR email. Flag
 
 _ADVERSARIAL = """Independently challenge the change from the diff. Assume happy-path assumptions can fail and inspect trust boundaries, authorization, fail-open behavior, missing limits, edge inputs, protocol and API contracts, concurrency, partial failure, fallbacks, and rollback. Report defensible source-level defects with likely consequences and mitigations. Avoid speculative attack chains."""
 
-_MATCH = """The input contains candidate groups identified from source location. Partition each candidate list into groups of exactly the same underlying issue. Same hunk, category, or general symptom is insufficient: require the same failure mode and cause. Read checkout evidence when needed. Leave uncertain or distinct findings in singleton groups. Never move a finding across candidate lists. Return each input ID exactly once, including singletons."""
+_MATCH = """Partition the supplied findings into groups of exactly the same underlying issue, even across files or hunks. The locations, anchors and hunk IDs are hints, not boundaries. Similar wording, the same hunk, category, or general symptom is insufficient: require the same failure mode and cause. Read checkout evidence when needed. Leave uncertain or distinct findings in singleton groups. Return each supplied ID exactly once, including singletons."""
+
+_REPO = """Use read_file with ref=head (the default) and ref=base to compare the pinned versions without executing code. Use pr_commits(path) and show_commit_patch(sha, path) to tie a change to a commit and its message, especially when attributing the removal of a guard. If the path was renamed, inspect the earlier path at base as needed."""
+
+_SCOPE = """For OUT_OF_SCOPE give scope_source ('PR description' or 'spec:' followed by the exact attached spec path), scope_quote (verbatim from that source), and scope_explanation (why that text explicitly excludes the same actor, operation, preconditions and effect). Diff, code, commit messages and tool output are not scope sources. If the applicability is uncertain, do not return OUT_OF_SCOPE. Leave these fields null otherwise."""
 
 _CALIBRATION = """For any concern claiming removed or weakened protection, first establish intent using relevant spec, then PR description, then the commit message that applies to the change. If all are silent or the responsible commit is unclear, record the uncertainty and treat it as an author question. Distinguish an artifact of the old data model from a guard that still makes sense in the new model. Trace the normal flow and identify the layer that maintains the invariant now. If it migrated, show where. If it is unowned, describe the regression and a fix compatible with the new contract.
 
-For Should Fix or above, remove each premise without first-hand evidence and regrade the remaining claim. Return a corrected severity and reason if the grade changes. List unverified premises and base the release gate solely on verified premises. Mark hypothetical bypasses, future assumptions, and non-normal-path conjecture hypothetical. For Must Fix require both a concrete ordinary user-visible, build, CI, or data-correctness failure path and evidence merging ships the breakage. For security, describe only the source-level trigger class and consequence, without payloads or steps that enable exploitation. Dead tests, unused config, and documentation gaps alone do not block release. Set fix_is_local only when the suggested fix is specific, directly supported by the code, and has no unresolved ownership or product tradeoff."""
+For Should Fix or above, remove each premise without first-hand evidence and regrade the remaining claim. Return a corrected severity and reason if the grade changes. List unverified premises. Set repro_path_verified true only if the described failure still follows from first-hand evidence after every unverified premise is removed; otherwise set it false. For each security finding or consensus group involving one, return all four security_facts and security_matrix_severity; use INCONCLUSIVE or leave the gate false if calibration cannot be supported. Mark hypothetical bypasses, future assumptions, and non-normal-path conjecture hypothetical. For Must Fix require both a concrete ordinary user-visible, build, CI, or data-correctness failure path and evidence merging ships the breakage. For security, describe only the source-level trigger class and consequence, without payloads or steps that enable exploitation. Dead tests, unused config, and documentation gaps alone do not block release. Set fix_is_local only when the suggested fix is specific, directly supported by the code, and has no unresolved ownership or product tradeoff."""
 
-_VERIFIER = """Verify each supplied finding independently. Emit one verdict per finding ID. Before adjudication: (1) check spec scope, recognizing OUT_OF_SCOPE only with a verbatim quote explicitly excluding this flow; (2) search relevant checkout patterns, callers, default behavior and tests; (3) seek a comparable baseline and explain the material difference or cite concrete counter-evidence from comparable code; (4) for crash/no-op/undefined assertions, trace the real runtime mechanism including framework and library defaults; (5) check middleware, database constraints, framework defaults and upstream guards that may mitigate the claim; (6) trace source-level reachability and actual impact. CONFIRMED requires a supported claim, REFUTED requires counter-evidence, PARTIAL identifies the paths still affected, and INCONCLUSIVE identifies missing proof. Provide exact search queries and file:line reads as evidence; if you cannot search or read enough, use INCONCLUSIVE and explain what was unavailable. Preserve the original finding. If this is a lone finding, explain a plausible blind spot if evidence supports one (e.g. context a diff-only axis could not see), else use null."""
+_VERIFIER = """Verify each supplied finding independently. Emit one verdict per finding ID. Before adjudication: (1) check spec scope, recognizing OUT_OF_SCOPE only with a verbatim quote explicitly excluding this flow; (2) search relevant checkout patterns, callers, default behavior and tests; (3) seek a comparable baseline and explain the material difference or cite concrete counter-evidence from comparable code; (4) for crash/no-op/undefined assertions, trace the real runtime mechanism including framework and library defaults; (5) check middleware, database constraints, framework defaults and upstream guards that may mitigate the claim; (6) trace source-level reachability and actual impact. CONFIRMED requires a supported claim, REFUTED requires counter-evidence, PARTIAL identifies the paths still affected; set confirmed_claim to a standalone comment expressing only the confirmed failure and impact, plus a fix only if it is supported for that scope. Otherwise set confirmed_claim to null. INCONCLUSIVE identifies missing proof. Provide exact search queries and file:line reads as evidence; if you cannot search or read enough, use INCONCLUSIVE and explain what was unavailable. Preserve the original finding. If this is a lone finding, explain a plausible blind spot if evidence supports one (e.g. context a diff-only axis could not see), else use null."""
 
 _BASELINE = """One row per consensus group ID. Perform a lightweight baseline check rather than redoing truth verification: search comparable project conventions and grade supports, conflicts, or no-precedent, with exact queries and file:line sources. Check scope against the same flow; use OUT_OF_SCOPE only with a verbatim quote explicitly excluding it. A convention conflict alone never removes a finding. Evaluate the release gate and calibration based on shared evidence for this issue. Preserve uncertainty in evidence and leave unsupported gate fields null/false."""
 
@@ -107,6 +113,10 @@ def system_prompt(phase: str, language: str) -> tuple[str, dict]:
     "verify": (_VERIFIER + "\n\n" + _CALIBRATION + "\n\n" + _SECURITY, VERIFY_SCHEMA),
     "baseline": (_BASELINE + "\n\n" + _CALIBRATION + "\n\n" + _SECURITY, BASELINE_SCHEMA),
   }[phase]
+  if phase in {"primary", "match", "verify", "baseline"}:
+    instruction += "\n\n" + _REPO
+  if phase in {"verify", "baseline"}:
+    instruction += "\n\n" + _SCOPE
   return (f"{_BOUNDARY}\n\n{instruction}\n\nWrite human-facing prose in language {json.dumps(language)}. "
           "Keep schema keys and enum values unchanged. Return only a strict JSON object, "
           f"without markdown or other prose, matching this schema:\n{json.dumps(schema)}", schema)

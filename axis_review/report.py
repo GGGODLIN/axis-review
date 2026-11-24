@@ -4,8 +4,8 @@ import re
 from pathlib import Path
 
 from .config import Config, ensure_no_credentials
-from .llm import CallRecord, UNAVAILABLE
-from .selfcheck import BUCKETS
+from .llm import CallRecord, UNAVAILABLE, unsafe_body_reason
+from .selfcheck import BUCKETS, strict_passthrough
 
 
 LIMITS = (
@@ -23,27 +23,34 @@ def _json(value, **kwargs) -> str:
   return json.dumps(value, ensure_ascii=True, allow_nan=False, **kwargs)
 
 
-def call_rows(records: list[CallRecord]) -> list[dict]:
-  return [{"seq": row.seq, "phase": row.phase, "axis": row.axis, "endpoint": row.endpoint,
-           "model_requested": row.model, "model_observed": row.model_observed, "status": row.status,
-           "receipt_id": row.receipt_id, "response_id": row.response_id, "latency_s": row.latency_s,
-           "usage": row.usage, "error": row.error, "req_path": f"bodies/{row.seq}.req.json",
-           "resp_path": f"bodies/{row.seq}.resp.json"}
-          for row in sorted(records, key=lambda record: record.seq)]
+def call_rows(records: list[CallRecord], config: Config) -> list[dict]:
+  rows = []
+  for call in sorted(records, key=lambda record: record.seq):
+    endpoint = config.endpoints[call.endpoint]
+    row = {"seq": call.seq, "phase": call.phase, "axis": call.axis, "endpoint": call.endpoint,
+           "model_requested": call.model, "model_observed": call.model_observed, "status": call.status,
+           "receipt_id": call.receipt_id, "response_id": call.response_id, "latency_s": call.latency_s,
+           "usage": call.usage, "error": call.error, "receipt_expected": endpoint.receipts == "phala-aci"}
+    for label, short, payload in (("request", "req", call.request_bytes), ("response", "resp", call.response_bytes)):
+      reason = unsafe_body_reason(payload, config)
+      row[f"{short}_path"] = None if reason else f"bodies/{call.seq}.{short}.json"
+      if reason:
+        row[f"{label}_body_hash_unavailable"] = reason
+    rows.append(row)
+  return rows
 
 
-def write_calls(out_dir: Path, records: list[CallRecord], config: Config) -> None:
-  rows = call_rows(records)
+def write_calls(out_dir: Path, records: list[CallRecord], config: Config) -> list[dict]:
+  rows = call_rows(records, config)
   index = "".join(_json(row, separators=(",", ":")) + "\n" for row in rows).encode()
   ensure_no_credentials(index, config)
-  for row in records:
-    ensure_no_credentials(row.request_bytes, config)
-    ensure_no_credentials(row.response_bytes, config)
   (out_dir / "bodies").mkdir()
-  for row in records:
-    (out_dir / f"bodies/{row.seq}.req.json").write_bytes(row.request_bytes)
-    (out_dir / f"bodies/{row.seq}.resp.json").write_bytes(row.response_bytes)
+  for row, call in zip(rows, sorted(records, key=lambda record: record.seq)):
+    for key, payload in (("req_path", call.request_bytes), ("resp_path", call.response_bytes)):
+      if row[key] is not None:
+        (out_dir / row[key]).write_bytes(payload)
   (out_dir / "calls.jsonl").write_bytes(index)
+  return rows
 
 
 def write_evidence(out_dir: Path, evidence: dict, config: Config) -> None:
@@ -73,7 +80,7 @@ def _table(headers, rows):
 
 def _usage(calls):
   costs = []
-  tokens = {key: 0 for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+  tokens = {key: [] for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
   reported = 0
   for call in calls:
     usage = call["usage"]
@@ -83,14 +90,15 @@ def _usage(calls):
     cost = usage.get("cost")
     if type(cost) is int or (type(cost) is float and math.isfinite(cost)):
       costs.append(cost)
-    for key in tokens:
+    for key, values in tokens.items():
       if type(usage.get(key)) is int:
-        tokens[key] += usage[key]
+        values.append(usage[key])
   parts = [f"Usage reported on {reported}/{len(calls)} HTTP attempts."]
   if costs:
     parts.append(f"Reported cost sum: {sum(costs)} ({len(costs)} attempts reported costs).")
-  if reported:
-    parts.append("Reported token totals: " + ", ".join(f"{key}={value}" for key, value in tokens.items()) + ".")
+  totals = [f"{key}={sum(values)} ({len(values)}/{len(calls)} attempts)" for key, values in tokens.items() if values]
+  if totals:
+    parts.append("Reported token totals: " + ", ".join(totals) + ".")
   return " ".join(parts)
 
 
@@ -114,6 +122,12 @@ def _axes(evidence):
   return _table(("Role", "State", "Endpoint", "Requested model", "Observed models", "Errors"), rows)
 
 
+def _proof(item, evidence):
+  if strict_passthrough(item):
+    return {}
+  return evidence["verification"].get(item["id"]) or evidence["baselines"].get(item["group_id"], {})
+
+
 def _detail(item, evidence, number):
   location = item["location"]
   pinned = location["line_start"]
@@ -123,7 +137,7 @@ def _detail(item, evidence, number):
   else:
     end = location["line_end"]
     where = str(pinned) if end == pinned else f"{pinned}–{end}"
-  proof = evidence["verification"].get(item["id"]) or evidence["baselines"].get(item["group_id"], {})
+  proof = _proof(item, evidence)
   rows = [f"### F-{number:02d} {_text(item['title'])}", "",
           f"- UID `{item['uid']}`. Source {_text(item['axis'])} using {_text(item['model_observed'])}.",
           f"- File {_text(item['file'])}. Line {_text(where)} ({_text(location['status'])}).",
@@ -138,17 +152,31 @@ def _detail(item, evidence, number):
   if item["security_facts"]:
     rows.append(f"- Initial security facts {_text(_json(item['security_facts']))}")
   for key, label in (("evidence", "Counter-evidence or verification evidence"), ("queries", "Verifier queries"),
-                     ("scope_quote", "Scope quote"), ("severity_reason", "Severity reason"),
+                     ("scope_quote", "Scope quote"), ("scope_source", "Scope source"),
+                     ("scope_explanation", "Scope explanation"), ("severity_reason", "Severity reason"),
                      ("security_facts", "Verified security facts"), ("security_matrix_severity", "Security matrix"),
                      ("unverified_premises", "Unverified premises"), ("blind_spot_explanation", "Blind spot"),
                      ("repro_path", "Failure path"), ("error", "Verification error")):
     if proof.get(key):
       value = ", ".join(proof[key]) if isinstance(proof[key], list) else proof[key]
       rows.append(f"- {label} {_text(value)}")
+  if proof.get("reported_verdict"):
+    rejected = proof["reported_verdict"]
+    rows.append(f"- Non-independent verifier result (not applied): {rejected['verdict']}. {_text(rejected['evidence'])}")
   rows.extend(f"- {_text(note)}" for note in item["calibration_notes"])
-  comment = f"{item['problem']}\n\n{item['impact']}\n\n{item['fix']}"
+  for member in item["member_findings"]:
+    member_proof = _proof(member, evidence)
+    rows.append(f"- Also raised by {_text(member['axis'])} ({member['severity']}, {_text(member['file'])}): "
+                f"{_text(member['problem'])} Initial evidence: {_text(member['evidence'])}")
+    if member_proof.get("evidence") and member_proof is not proof:
+      rows.append(f"  - {_text(member['verdict'] or member['verification_status'])}: {_text(member_proof['evidence'])}")
   if item["bucket"] == "Reference":
     comment = f"Reference ({item['verdict']}). {proof.get('scope_quote') or proof.get('evidence', '')}\n\nOriginal concern: {item['problem']}"
+  elif item["verdict"] == "PARTIAL":
+    comment = proof.get("confirmed_claim") or (f"Partially verified; see the verified evidence: {proof['evidence']} "
+                                                "The original scope and proposed fix still need confirmation.")
+  else:
+    comment = f"{item['problem']}\n\n{item['impact']}\n\n{item['fix']}"
   rows.extend(("", "Paste-ready inline comment", "", _block(comment), ""))
   return rows
 
@@ -166,7 +194,10 @@ def render(evidence: dict, tee: dict) -> str:
            f"Files {counts['files']} · Findings {counts['findings']} · " +
            " · ".join(f"{label} {count}" for label, count in counts["buckets"].items()), "",
            "Anchor counts · " + " · ".join(f"{_text(label)} {count}" for label, count in counts["anchors"].items()), "",
-           f"Version check {_text(drift['state'])}", ""]
+           f"Version check {_text(drift['state'])}", "",
+           "The publication-time version check is not covered by the application quote.", ""]
+  if evidence.get("review_failed"):
+    lines.extend((f"**Review failed.** {_text(evidence['failure_reason'])}", ""))
   if drift["state"] == "DRIFT":
     lines.extend((f"Current base `{drift['base_sha']}` · Current head `{drift['head_sha']}`. Review evidence uses the original versions.", ""))
   lines.extend((*_axes(evidence), "", "## Spec basis", "",
@@ -212,7 +243,8 @@ def render(evidence: dict, tee: dict) -> str:
   lines.extend(("", "## Receipts and application quote", ""))
   receipts = evidence["receipts"]
   if "checks" in receipts:
-    lines.extend((f"Fetched {receipts['fetched']} · Verified {receipts['verified']}", ""))
+    lines.extend((f"Expected {receipts['expected']} · Fetched {receipts['fetched']} · "
+                  f"Verified {receipts['verified']} · Missing {receipts['missing']}", ""))
     lines.extend(_table(("Check", "Statuses"), [(key, ", ".join(f"{state}={count}" for state, count in values.items()))
                                                  for key, values in receipts["checks"].items()]))
   else:
@@ -223,6 +255,13 @@ def render(evidence: dict, tee: dict) -> str:
     lines.extend(("", "Application quote unavailable.", *([_text(tee["error"])] if tee.get("error") else [])))
   lines.extend(("", "## Usage", "", _usage(evidence["calls"]), "", "## Limits and self-check", ""))
   limits = [*LIMITS, *pr["material_notes"], *spec["notes"]]
+  overflow = evidence["matching"].get("overflow", 0)
+  if overflow:
+    limits.append(f"Root-cause matching excluded {overflow} findings beyond its input cap; they were kept for individual review.")
+  for call in evidence["calls"]:
+    for label in ("request", "response"):
+      if reason := call.get(f"{label}_body_hash_unavailable"):
+        limits.append(f"HTTP attempt {call['seq']}: {label} body hash verification unavailable. {reason}.")
   limits.extend(f"{axis} returned {run['ignored_findings']} out-of-assignment findings"
                 for axis, data in evidence["axes"].items() for run in data["runs"] if run["ignored_findings"])
   limits.extend(f"Coverage repair failed: {run['error']}" for run in evidence["coverage_repair"] if run["error"])

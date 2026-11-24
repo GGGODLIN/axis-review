@@ -15,7 +15,10 @@ import rfc8785
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+from axis_review.config import Config, Endpoint
+from axis_review.llm import CallRecord
 from axis_review.receipts import process, verify
+from axis_review.report import write_calls as write_call_artifacts
 
 
 def digest(data):
@@ -34,7 +37,7 @@ class ReceiptTests(unittest.TestCase):
     self.response = b'{"id":"chat-123","choices":[]}\n'
     self.call = {
       "seq": 1, "endpoint": "phala", "status": 200,
-      "receipt_id": "rcpt-123", "response_id": "chat-123",
+      "receipt_id": "rcpt-123", "response_id": "chat-123", "receipt_expected": True,
       "req_path": "bodies/1.req.json", "resp_path": "bodies/1.resp.json",
     }
     (self.root / self.call["req_path"]).write_bytes(self.request)
@@ -90,14 +93,66 @@ class ReceiptTests(unittest.TestCase):
   def test_valid_receipt(self):
     self.save()
     summary = verify(self.root)
-    self.assertEqual((summary["fetched"], summary["verified"]), (1, 1))
+    self.assertEqual((summary["expected"], summary["fetched"], summary["verified"], summary["missing"]), (1, 1, 1, 0))
     self.assertEqual(set(summary["receipts"][0]["checks"].values()), {"pass"})
     self.assertEqual(summary["not_verified"], [
       "TDX quote vs Intel DCAP collateral",
       "RTMR3 event-log replay / compose hash",
       "attested upstream session",
     ])
-    self.assertEqual(json.loads((self.saved / "verification.json").read_text()), summary)
+
+  def test_verify_leaves_input_bundle_unchanged(self):
+    self.save()
+    before = {file: file.read_bytes() for file in self.root.rglob("*") if file.is_file()}
+    self.assertEqual(verify(self.root)["verified"], 1)
+    self.assertEqual({file: file.read_bytes() for file in self.root.rglob("*") if file.is_file()}, before)
+
+  def test_signed_receipt_identity_matches_lookup_id(self):
+    for id_field, alternate in (("receipt_id", "rcpt-other"), ("chat_id", "chat-other")):
+      original = self.receipt[id_field]
+      self.write_calls(self.call if id_field == "receipt_id" else {**self.call, "receipt_id": None})
+      for value in (alternate, None):
+        with self.subTest(id_field=id_field, value=value):
+          if value is None:
+            self.receipt.pop(id_field)
+          else:
+            self.receipt[id_field] = value
+          self.sign()
+          self.save()
+          checks = self.assert_status("identity", "fail")
+          self.assertEqual(checks["signature"], "pass")
+      self.receipt[id_field] = original
+      self.sign()
+      self.save()
+      self.assertEqual(verify(self.root)["verified"], 1)
+
+  def test_expected_calls_survive_missing_artifacts_and_ids(self):
+    self.saved.rmdir()
+    self.write_calls(
+      self.call,
+      {**self.call, "seq": 2, "receipt_id": None, "response_id": None},
+      {**self.call, "seq": 3, "receipt_expected": False},
+    )
+    summary = verify(self.root)
+    self.assertEqual((summary["expected"], summary["verified"], summary["missing"]), (2, 0, 2))
+    self.assertEqual([(row["seq"], row["checks"]["receipt"]) for row in summary["receipts"]],
+                     [(1, "missing"), (2, "missing")])
+    self.assertFalse(self.saved.exists())
+
+  def test_saved_call_index_tracks_receipts_without_artifacts(self):
+    config = Config({
+      "phala": Endpoint("https://receipt.example/v1", receipts="phala-aci"),
+      "local": Endpoint("http://127.0.0.1/v1"),
+    }, (), {})
+    calls = [CallRecord(seq, "initial", "neutral", endpoint, "finder", "finder", b"{}", b"{}",
+                        status, {}, None, None, 0, None, None)
+             for seq, endpoint, status in ((1, "phala", 200), (2, "phala", 429), (3, "local", 200))]
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      write_call_artifacts(root, calls, config)
+      summary = verify(root)
+    self.assertEqual((summary["expected"], summary["verified"], summary["missing"]), (1, 0, 1))
+    self.assertEqual([row["seq"] for row in summary["receipts"]], [1])
 
   def test_tampered_signature(self):
     signature = bytearray.fromhex(self.receipt["signature"])
@@ -168,13 +223,14 @@ class ReceiptTests(unittest.TestCase):
     saved = json.loads((self.saved / "attestation-phala.json").read_bytes())
     self.assertEqual(set(saved), {"nonce", "fetch_error"})
     self.assertTrue(saved["fetch_error"])
+    self.assertEqual(json.loads((self.saved / "verification.json").read_text()), summary)
 
   def test_process_uses_same_credential_and_one_nonce_per_endpoint(self):
     self.write_calls(
       self.call,
       {**self.call, "seq": 2, "receipt_id": None},
-      {**self.call, "seq": 3, "status": 429},
-      {**self.call, "seq": 4, "endpoint": "magpie"},
+      {**self.call, "seq": 3, "status": 429, "receipt_expected": False},
+      {**self.call, "seq": 4, "endpoint": "magpie", "receipt_expected": False},
       {**self.call, "seq": 5, "receipt_id": "rcpt-missing"},
       {**self.call, "seq": 6, "receipt_id": "rcpt-unavailable"},
       {**self.call, "seq": 7, "receipt_id": "rcpt-redirect"},

@@ -4,6 +4,7 @@ services:
     platform: linux/amd64
     environment:
       PHALA_API_KEY: ${PHALA_API_KEY}
+      AXIS_REVIEW_SERVE_TOKEN: ${AXIS_REVIEW_SERVE_TOKEN}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       AXIS_REVIEW_REF: ${AXIS_REVIEW_REF}
       PR_URLS: ${PR_URLS}
@@ -21,12 +22,29 @@ services:
       - bash
       - -ec
       - |
-        : "$${AXIS_REVIEW_REF:?Set AXIS_REVIEW_REF to a commit SHA}"
+        if ! [[ "$${AXIS_REVIEW_REF:-}" =~ ^[0-9a-fA-F]{40}$$ ]]; then
+          printf '%s\n' 'Set AXIS_REVIEW_REF to a full 40-hex commit SHA' >&2
+          exit 1
+        fi
+        : "$${AXIS_REVIEW_SERVE_TOKEN:?Set AXIS_REVIEW_SERVE_TOKEN to a secret access token}"
         : "$${PR_URLS:?Set PR_URLS to space-separated GitHub pull request URLs}"
-        python -m pip install --src /app -e "axis-review[tee] @ git+https://github.com/GGGODLIN/axis-review@$${AXIS_REVIEW_REF}"
+        ref="$$(printf '%s' "$$AXIS_REVIEW_REF" | tr 'A-F' 'a-f')"
+        source="$$(mktemp -d)"
+        git init "$$source"
+        git -C "$$source" fetch --depth 1 https://github.com/GGGODLIN/axis-review "$$ref"
+        git -C "$$source" checkout --detach FETCH_HEAD
+        check_ref() {
+          if [[ "$$(git -C "$$source" rev-parse HEAD)" != "$$ref" ]]; then
+            printf '%s\n' 'Checked-out commit does not match AXIS_REVIEW_REF' >&2
+            exit 1
+          fi
+        }
+        check_ref
+        python -m pip install 'dstack-sdk==0.6.0' -e "$$source[tee]"
+        check_ref
         read -r -a pr_urls <<< "$$PR_URLS"
-        axis-review review "$${pr_urls[@]}" --config /app/axis-review/config.phala.toml --out /data/out
-        exec axis-review serve /data/out --port 8080
+        axis-review review "$${pr_urls[@]}" --config "$$source/config.phala.toml" --out /data/out
+        exec axis-review serve /data/out --host 0.0.0.0 --port 8080
 
 volumes:
   review-data:

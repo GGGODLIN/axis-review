@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, patch
 
 from axis_review.tee_quote import write_quote
 
@@ -28,17 +28,32 @@ class TeeQuoteTests(unittest.TestCase):
       socket.touch()
       evidence = b'{"findings": []}\n'
       (root / "evidence.json").write_bytes(evidence)
-      client = Mock()
-      client.info.return_value = SimpleNamespace(app_id="test-app")
-      client.get_quote.return_value = SimpleNamespace(quote="quote-data")
-      factory = Mock(return_value=client)
-      sdk = SimpleNamespace(DstackClient=factory)
-      with patch("axis_review.tee_quote.DSTACK_SOCKET", socket):
-        with patch.dict(sys.modules, {"dstack_sdk": sdk}):
-          result = write_quote(root)
-      factory.assert_called_once_with()
-      client.info.assert_called_once_with()
-      client.get_quote.assert_called_once_with(hashlib.sha256(evidence).digest())
+      try:
+        import dstack_sdk
+        import httpx
+      except ImportError:
+        self.skipTest("Install the tee extra to exercise the dstack SDK")
+
+      requests = []
+
+      def rpc(request):
+        requests.append((request.url.path, json.loads(request.content)))
+        if request.url.path == "/Info":
+          return httpx.Response(200, json={
+            "app_id": "test-app", "instance_id": "", "app_cert": "", "app_name": "",
+            "device_id": "", "key_provider_info": "", "compose_hash": "",
+            "tcb_info": {"app_compose": "", "event_log": []},
+          })
+        return httpx.Response(200, json={"quote": "quote-data", "event_log": "[]"})
+
+      with (patch("axis_review.tee_quote.DSTACK_SOCKET", socket),
+            patch.object(httpx, "HTTPTransport", return_value=httpx.MockTransport(rpc)) as transport):
+        self.assertTrue(hasattr(dstack_sdk.DstackClientV0, "get_quote"))
+        result = write_quote(root)
+      transport.assert_called_once_with(uds=str(socket))
+      self.assertEqual(requests, [
+        ("/Info", {}), ("/GetQuote", {"report_data": hashlib.sha256(evidence).hexdigest()}),
+      ])
       self.assertEqual(result, {
         "in_tee": True, "app_id": "test-app", "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
         "quote": "quote-data",
@@ -52,12 +67,13 @@ class TeeQuoteTests(unittest.TestCase):
       socket.touch()
       (root / "evidence.json").write_bytes(b"{}\n")
       marker = secrets.token_hex(16)
-      client = Mock()
+      client = MagicMock()
       client.info.return_value = SimpleNamespace(app_id="test-app")
       client.get_quote.return_value = SimpleNamespace(quote=marker)
-      sdk = SimpleNamespace(DstackClient=Mock(return_value=client))
+      sdk = SimpleNamespace(DstackClientV0=lambda endpoint: client)
+      transport = SimpleNamespace(HTTPError=OSError)
       with (patch("axis_review.tee_quote.DSTACK_SOCKET", socket),
-            patch.dict(sys.modules, {"dstack_sdk": sdk}),
+            patch.dict(sys.modules, {"dstack_sdk": sdk, "httpx": transport}),
             patch.dict("os.environ", {"GITHUB_TOKEN": marker})):
         with self.assertRaisesRegex(ValueError, "contains an environment credential"):
           write_quote(root)

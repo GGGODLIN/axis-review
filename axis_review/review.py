@@ -12,42 +12,54 @@ from .anchors import anchor_file, finding_uid
 from .config import Config, Model, verifier_role
 from .github import ChangedFile, PR
 from .llm import Client, UNAVAILABLE
-from .prompts import SEVERITIES, STRICT_LIABILITY, system_prompt
-from .repo_tools import confined, matches_glob
-from .selfcheck import ANCHOR_STATES, BUCKETS, PRIMARY_NA, check
+from .prompts import SECURITY_FACTS, SEVERITIES, system_prompt
+from .repo_tools import git_lines, matches_glob
+from .selfcheck import ANCHOR_STATES, BUCKETS, PRIMARY_NA, check, has_source_evidence, release_gate, strict_passthrough
 
 
 NO_ISSUES = "REVIEWED_NO_ISSUES"
 SKIPPED = "INTENTIONALLY_SKIPPED"
+MATCH_LIMIT = 60
+_GENERATED = re.compile(r"(?im)^\s*(?://|#|/\*|\*)\s*(?:code generated[^\n]*do not edit\b|@generated\b)")
 
 
 @dataclass(frozen=True)
 class Result:
   out_dir: Path
   evidence: dict
+  review_failed: bool = False
+  failure_reason: str | None = None
 
 
-def is_source(file: ChangedFile) -> bool:
+def is_source(file: ChangedFile, *, root: Path | None = None, head_sha: str | None = None) -> bool:
   parts = PurePosixPath(file.path.lower()).parts
   name = parts[-1]
   non_source_dirs = {"doc", "docs", "documentation", "vendor", "vendors", "third_party",
                      "third-party", "node_modules", "generated", "__generated__", "dist"}
   lock_names = {"go.sum", "yarn.lock", "gemfile.locked", "npm-shrinkwrap.json",
                 "package-lock.json", "pnpm-lock.yaml", "bun.lockb", "uv.lock"}
-  return not (non_source_dirs.intersection(parts[:-1]) or name in lock_names
-              or name.endswith((".lock", ".md", ".mdx", ".rst", ".adoc", ".txt", ".generated.ts",
-                                ".generated.js", ".gen.go", ".pb.go", ".min.js", ".min.css"))
-              or name.startswith(("readme", "changelog", "license")))
+  if (non_source_dirs.intersection(parts[:-1]) or name in lock_names
+      or name.endswith((".lock", ".md", ".mdx", ".rst", ".adoc", ".txt", ".generated.ts",
+                        ".generated.js", ".gen.go", ".pb.go", ".min.js", ".min.css"))
+      or name.startswith(("readme", "changelog", "license", "zz_generated."))):
+    return False
+  if root is not None and head_sha is not None and file.status != "removed":
+    try:
+      prefix = github.read_blob(root, head_sha, file.path)[:8192].decode("utf-8", errors="replace")
+      return not _GENERATED.search(prefix)
+    except github.GitHubError:
+      pass
+  return True
 
 
-def chunk_files(files: list[ChangedFile], source_limit: int = 15,
-                line_limit: int = 800) -> list[list[ChangedFile]]:
+def chunk_files(files: list[ChangedFile], source_limit: int = 15, line_limit: int = 800,
+                *, root: Path | None = None, head_sha: str | None = None) -> list[list[ChangedFile]]:
   chunks = []
   current = []
   sources = lines = 0
   for file in sorted(files, key=lambda item: item.path):
-    source = int(is_source(file))
-    size = file.additions + file.deletions
+    source = int(is_source(file, root=root, head_sha=head_sha))
+    size = len(git_lines(file.patch)) if file.patch is not None else file.additions + file.deletions
     if current and (sources + source > source_limit or lines + size > line_limit):
       chunks.append(current)
       current, sources, lines = [], 0, 0
@@ -83,16 +95,12 @@ def _spec_context(pr: PR, root: Path, config: Config) -> dict:
   if not config.spec_globs:
     return context
   remaining = config.spec_max_chars
-  for path in github.tracked_paths(root):
+  for path in github.tracked_paths(root, pr.head_sha):
     if not any(matches_glob(path, pattern) for pattern in config.spec_globs):
       continue
     try:
-      source = confined(root, path)
-      if source.is_symlink() or not source.is_file() or (root / path).is_symlink():
-        raise ValueError
-      with source.open(encoding="utf-8", newline="") as file:
-        text = file.read(remaining + 1)
-    except (OSError, ValueError):
+      text = github.read_blob(root, pr.head_sha, path).decode("utf-8")
+    except (UnicodeError, github.GitHubError):
       context["notes"].append(f"Spec file unavailable at head: {path}")
       continue
     truncated = len(text) > remaining
@@ -105,12 +113,12 @@ def _spec_context(pr: PR, root: Path, config: Config) -> dict:
   return context
 
 
-def _call(client, root, phase, axis, target: Model, prompt, data, *, tools):
+def _call(client, root, phase, axis, target: Model, prompt, data, *, tools, pr=None):
   system, schema = system_prompt(prompt, client.config.language)
   reply, record = run_json_with_record(
     client, phase=phase, axis=axis, endpoint=target.endpoint, model=target.model, system=system,
     user=json.dumps(data, ensure_ascii=True, allow_nan=False), schema=schema, tools=tools,
-    root=root if tools else None,
+    root=root if tools else None, base_sha=pr.base_sha if pr else None, head_sha=pr.head_sha if pr else None,
   )
   return reply, record.model_observed
 
@@ -124,7 +132,7 @@ def _initial(client, pr, root, spec, axis, chunks, phase="initial"):
     if axis.id == "primary":
       data["commit_messages"] = pr.commit_messages
     try:
-      reply, observed = _call(client, root, phase, axis.id, axis, axis.id, data, tools=axis.id == "primary")
+      reply, observed = _call(client, root, phase, axis.id, axis, axis.id, data, tools=axis.id == "primary", pr=pr)
       findings = [dict(item, axis=axis.id, model=axis.model, model_observed=observed)
                   for item in reply["findings"] if item["file"] in paths]
       ignored = len(reply["findings"]) - len(findings)
@@ -137,7 +145,7 @@ def _initial(client, pr, root, spec, axis, chunks, phase="initial"):
   return runs
 
 
-def _prepare_findings(root: Path, runs: list[dict], files: list[ChangedFile]) -> list[dict]:
+def _prepare_findings(root: Path, runs: list[dict], files: list[ChangedFile], *, head_sha=None) -> list[dict]:
   hunks = {file.path: [(int(start), int(length) if length else 1)
                        for start, length in re.findall(r"(?m)^@@ .*? \+(\d+)(?:,(\d+))? @@", file.patch or "")]
            for file in files}
@@ -146,7 +154,7 @@ def _prepare_findings(root: Path, runs: list[dict], files: list[ChangedFile]) ->
     if run["reply"] is None:
       continue
     for row in run["reply"]["findings"]:
-      anchor = anchor_file(root, row["file"], row["anchor"], row["line_start"])
+      anchor = anchor_file(root, row["file"], row["anchor"], row["line_start"], head_sha=head_sha)
       start = anchor.line_start or row["line_start"]
       end = anchor.line_end or row["line_end"] or start
       related = [index for index, (line, length) in enumerate(hunks[row["file"]])
@@ -158,9 +166,6 @@ def _prepare_findings(root: Path, runs: list[dict], files: list[ChangedFile]) ->
 def _overlap(left: dict, right: dict) -> bool:
   if left["file"] != right["file"]:
     return False
-  if left["anchor"] == right["anchor"] and left["anchor"] != "<none>":
-    return True
-
   def span(finding):
     location = finding.get("location", {})
     start = location.get("line_start") or finding.get("line_start")
@@ -171,42 +176,22 @@ def _overlap(left: dict, right: dict) -> bool:
   return a[0] is not None and b[0] is not None and max(a[0], b[0]) <= min(a[1], b[1])
 
 
-def _candidate_groups(findings: list[dict]) -> tuple[list[list[dict]], set[str]]:
-  groups = []
+def _location_corroboration(findings: list[dict]) -> set[str]:
+  by_file = {}
   corroborated = set()
   for item in findings:
-    touching = []
+    peers = by_file.setdefault(item["file"], [])
     hunks = set(item.get("hunks", ()))
-    for index, group in enumerate(groups):
-      overlaps = False
-      for other in group:
-        overlap = _overlap(item, other)
-        overlaps |= overlap
-        same_hunk = item["file"] == other["file"] and hunks.intersection(other.get("hunks", ()))
-        if item["axis"] != other["axis"] and (overlap or same_hunk):
-          corroborated.update((item["id"], other["id"]))
-      if overlaps:
-        touching.append(index)
-    related = [other for index in touching for other in groups[index]]
-    for index in reversed(touching):
-      del groups[index]
-    groups.append([*related, item])
-  return groups, corroborated
-
-
-def _match_candidates(findings: list[dict]) -> list[list[dict]]:
-  eligible = [item for item in findings if item.get("strict_liability") not in STRICT_LIABILITY]
-  groups, _ = _candidate_groups(eligible)
-  return [group for group in groups if len(group) > 1]
+    for other in peers:
+      if item["axis"] != other["axis"] and (_overlap(item, other) or hunks.intersection(other.get("hunks", ()))):
+        corroborated.update((item["id"], other["id"]))
+    peers.append(item)
+  return corroborated
 
 
 def group_findings(findings: list[dict], matched: list[list[str]]) -> list[dict]:
   by_id = {finding["id"]: finding for finding in findings}
-  _, corroborated = _candidate_groups(findings)
-  candidates = [{item["id"] for item in group} for group in _match_candidates(findings)]
-  if (Counter(item for group in matched for item in group) != Counter(item for group in candidates for item in group)
-      or any(not group or not any(set(group) <= options for options in candidates) for group in matched)):
-    raise AxisError("Match response was not an exact partition of candidate IDs")
+  corroborated = _location_corroboration(findings)
   used = {item for group in matched for item in group}
   partitions = [*matched, *([item] for item in by_id if item not in used)]
   groups = []
@@ -214,29 +199,32 @@ def group_findings(findings: list[dict], matched: list[list[str]]) -> list[dict]
   for ids in sorted(partitions, key=lambda items: min(order[item] for item in items)):
     ids = sorted(ids, key=order.__getitem__)
     axes = {by_id[item]["axis"] for item in ids}
-    consensus = "primary" in axes and len(axes) > 1
+    review_ids = [item for item in ids if not strict_passthrough(by_id[item])]
+    review_axes = {by_id[item]["axis"] for item in review_ids}
+    consensus = "primary" in review_axes and len(review_axes) > 1
     groups.append({"id": f"group-{len(groups) + 1}", "finding_ids": ids, "consensus": consensus,
                    "corroborated_ids": [item for item in ids if item in corroborated or len(axes) > 1]})
   return groups
 
 
-def _match(client, root, findings, spec):
-  candidates = _match_candidates(findings)
-  if not candidates:
-    return group_findings(findings, []), {"state": "N-A", "error": None}
+def _match(client, root, findings, spec, pr=None):
+  if len(findings) < 2:
+    return group_findings(findings, []), {"state": "N-A", "error": None, "overflow": 0}
+  candidates = findings[:MATCH_LIMIT]
+  expected = Counter(row["id"] for row in candidates)
   target = client.config.verifiers.get("for_diff_axes") or client.config.verifiers["for_primary"]
   observed = UNAVAILABLE
   try:
     reply, observed = _call(client, root, "match", "match", target, "match",
-                            {"candidates": candidates, "spec": spec}, tools=True)
+                            {"findings": candidates, "spec": spec}, tools=True, pr=pr)
+    if Counter(item for group in reply["groups"] for item in group) != expected:
+      raise AxisError("Match response was not an exact partition of candidate IDs")
     groups = group_findings(findings, reply["groups"])
     state = {"state": "PASS", "error": None, "model_observed": observed}
   except AxisError as error:
-    # Overlap still establishes corroboration when matching cannot establish consensus.
-    singletons = [[row["id"]] for group in candidates for row in group]
-    groups = group_findings(findings, singletons)
+    groups = group_findings(findings, [])
     state = {"state": "FAILED", "error": str(error), "model_observed": observed}
-  return groups, state
+  return groups, dict(state, overflow=len(findings) - len(candidates))
 
 
 def _validate_batch(rows, inputs, field, scope_field, verified_spec):
@@ -246,20 +234,37 @@ def _validate_batch(rows, inputs, field, scope_field, verified_spec):
     outcome = row[scope_field]
     if outcome == "OUT_OF_SCOPE":
       quote = row["scope_quote"]
-      if not quote or not any(quote in text for text in verified_spec):
-        raise AxisError("OUT_OF_SCOPE requires a verbatim quote from supplied spec or PR description")
-    elif outcome in {"CONFIRMED", "PARTIAL", "REFUTED"}:
-      if not row["queries"] or not re.search(r"\S+:\d+\b", row["evidence"]):
-        raise AxisError("Truth verdicts require search queries and file:line evidence")
+      if (not quote or quote not in verified_spec.get(row["scope_source"], "")
+          or not row["scope_explanation"]):
+        raise AxisError("OUT_OF_SCOPE requires a verbatim quote from the declared spec or PR description and an explanation of the exclusion")
+    if outcome != "INCONCLUSIVE" and not has_source_evidence(row):
+      raise AxisError("Verifier and baseline decisions require search queries and file:line evidence")
 
 
 def _empty_verification(finding_id: str, error: str, observed: str) -> dict:
   return {"finding_id": finding_id, "verdict": "INCONCLUSIVE", "evidence": error,
           "corrected_severity": None, "severity_reason": "No usable verifier result.", "queries": [],
-          "scope_quote": None, "repro_path": None, "ships_breakage": False, "hypothetical": False,
+          "scope_quote": None, "scope_source": None, "scope_explanation": None, "confirmed_claim": None,
+          "repro_path": None, "repro_path_verified": False, "ships_breakage": False, "hypothetical": False,
           "unverified_premises": [], "blind_spot_explanation": None, "fix_is_local": False,
           "security_facts": None, "security_matrix_severity": None,
           "model_observed": observed, "state": "FAILED", "error": error}
+
+
+def _independent(finding, row):
+  if (row.get("state") in {"FAILED", "INCONCLUSIVE"}
+      or cross_model(finding.get("model_observed"), row.get("model_observed")) != "SAME"):
+    return row
+  effective = _empty_verification(row.get("finding_id", finding.get("id")), "same observed model", row["model_observed"])
+  return dict(effective, state="INCONCLUSIVE", reported_verdict=row)
+
+
+def _is_security(finding):
+  return finding.get("security_facts") is not None or finding.get("strict_liability") is not None
+
+
+def _ran_axes_for(ran_axes, file):
+  return ran_axes if isinstance(ran_axes, int) else ran_axes.get(file, 0)
 
 
 def _verify(client, root, pr, spec, findings, groups, ran_axes):
@@ -270,9 +275,10 @@ def _verify(client, root, pr, spec, findings, groups, ran_axes):
   corroborated = {item for group in groups for item in group["corroborated_ids"]}
   targets = {role: [] for role in client.config.verifiers}
   for item in findings:
-    if item["strict_liability"] is None and item["id"] not in consensus_ids:
-      targets[verifier_role(item["axis"])].append(dict(item, lone=ran_axes >= 2 and item["id"] not in corroborated))
-  source = [spec["description"], *(file["text"] for file in spec["files"])]
+    if not strict_passthrough(item) and item["id"] not in consensus_ids:
+      lone = _ran_axes_for(ran_axes, item["file"]) >= 2 and item["id"] not in corroborated
+      targets[verifier_role(item["axis"])].append(dict(item, lone=lone))
+  source = {"PR description": spec["description"], **{f"spec:{file['path']}": file["text"] for file in spec["files"]}}
   common = {"spec": spec, "commit_messages": pr.commit_messages}
   size = client.config.verify_batch_size
   for role, inputs in targets.items():
@@ -283,10 +289,11 @@ def _verify(client, root, pr, spec, findings, groups, ran_axes):
       error = None
       try:
         reply, observed = _call(client, root, "verify", role, client.config.verifiers[role], "verify",
-                                dict(common, findings=batch), tools=True)
+                                dict(common, findings=batch), tools=True, pr=pr)
         _validate_batch(reply["verdicts"], ids, "finding_id", "verdict", source)
         for row in reply["verdicts"]:
-          verification[row["finding_id"]] = dict(row, model_observed=observed, state="PASS")
+          item = row["finding_id"]
+          verification[item] = _independent(by_id[item], dict(row, model_observed=observed, state="PASS"))
       except AxisError as exc:
         error = str(exc)
         for item in ids:
@@ -298,14 +305,17 @@ def _verify(client, root, pr, spec, findings, groups, ran_axes):
     ids = [group["id"] for group in batch]
     observed = UNAVAILABLE
     error = None
-    inputs = [{"group_id": group["id"], "findings": [by_id[item] for item in group["finding_ids"]]}
+    inputs = [{"group_id": group["id"], "findings": [by_id[item] for item in group["finding_ids"]
+                                                   if not strict_passthrough(by_id[item])]}
               for group in batch]
+    security = {group["group_id"]: any(map(_is_security, group["findings"])) for group in inputs}
     try:
       reply, observed = _call(client, root, "baseline", "for_diff_axes", client.config.verifiers["for_diff_axes"],
-                              "baseline", dict(common, groups=inputs), tools=True)
+                              "baseline", dict(common, groups=inputs), tools=True, pr=pr)
       _validate_batch(reply["baselines"], ids, "group_id", "scope", source)
       for row in reply["baselines"]:
-        baselines[row["group_id"]] = dict(row, state="PASS", model_observed=observed)
+        item = row["group_id"]
+        baselines[item] = dict(row, state="PASS", model_observed=observed, security_required=security[item])
     except AxisError as exc:
       error = str(exc)
       for item in ids:
@@ -324,8 +334,13 @@ def cross_model(finder: str | None, verifier: str | None) -> str:
 
 def classify(finding: dict, verification: dict | None = None, baseline: dict | None = None,
              *, consensus: bool = False, corroborated: bool = False, ran_axes: int = 1) -> dict:
-  proof = verification if verification is not None else (baseline or {})
-  strict = finding.get("strict_liability") in STRICT_LIABILITY
+  strict = strict_passthrough(finding)
+  if strict:
+    proof = {}
+  elif verification is not None:
+    proof = _independent(finding, verification)
+  else:
+    proof = baseline or {}
   verdict = proof.get("verdict")
   if proof.get("scope") == "OUT_OF_SCOPE":
     verdict = "OUT_OF_SCOPE"
@@ -333,7 +348,14 @@ def classify(finding: dict, verification: dict | None = None, baseline: dict | N
   effective = proof.get("corrected_severity") or finding["severity"]
   notes = []
   matrix = proof.get("security_matrix_severity")
-  if not strict and matrix and SEVERITIES.index(matrix) > SEVERITIES.index(effective):
+  security_required = _is_security(finding) or proof.get("security_required", False)
+  if not strict and security_required and (matrix not in SEVERITIES or
+                                            set(proof.get("security_facts") or {}) != set(SECURITY_FACTS["required"])):
+    security_calibrated = False
+    notes.append("Security calibration incomplete: requires four verifier facts and a matrix severity")
+  else:
+    security_calibrated = True
+  if security_calibrated and matrix and SEVERITIES.index(matrix) > SEVERITIES.index(effective):
     notes.append(f"Security matrix lowered {effective} to {matrix}")
     effective = matrix
   lone = ran_axes >= 2 and not corroborated and not consensus
@@ -344,7 +366,7 @@ def classify(finding: dict, verification: dict | None = None, baseline: dict | N
     notes.append("The verifier confirmed the finding and supplied no supported explanation for the other axes' silence")
 
   candidate = consensus or effective == "CRITICAL" or (verdict == "CONFIRMED" and relationship == "DIFFERENT")
-  gate = bool(proof.get("repro_path") and proof.get("ships_breakage") and not proof.get("hypothetical"))
+  gate = release_gate(proof, security_calibrated=security_calibrated)
   if verdict in {"REFUTED", "OUT_OF_SCOPE"}:
     bucket, action, reason = "Reference", "no-op", "Verification supplied counter-evidence or an explicit scope exclusion."
   elif strict:
@@ -356,8 +378,8 @@ def classify(finding: dict, verification: dict | None = None, baseline: dict | N
   else:
     bucket, action, reason = "Nice to Have", "no-op", "The available evidence supports optional follow-up."
   supported_fix = (verdict == "CONFIRMED" and relationship == "DIFFERENT") or (consensus and proof.get("state") == "PASS")
-  if (action == "ask-user" and supported_fix and proof.get("fix_is_local")
-      and not proof.get("hypothetical") and not proof.get("unverified_premises")):
+  if (action == "ask-user" and supported_fix and security_calibrated and has_source_evidence(proof)
+      and proof.get("fix_is_local") and not proof.get("hypothetical") and not proof.get("unverified_premises")):
     action, reason = "auto-fix", "Verification supports a specific local fix with clear ownership."
   verification_status = proof.get("state")
   if strict:
@@ -368,28 +390,32 @@ def classify(finding: dict, verification: dict | None = None, baseline: dict | N
   return {"bucket": bucket, "action": action, "action_reason": reason, "verdict": verdict,
           "effective_severity": finding["severity"] if strict else effective, "lone": lone,
           "cross_model": relationship, "calibration_notes": notes,
-          "verification_status": verification_status,
-          "repro_path": proof.get("repro_path"), "ships_breakage": proof.get("ships_breakage", False),
-          "hypothetical": proof.get("hypothetical", False)}
+          "verification_status": verification_status, "security_calibrated": security_calibrated,
+          "repro_path": proof.get("repro_path"), "repro_path_verified": proof.get("repro_path_verified", False),
+          "ships_breakage": proof.get("ships_breakage", False), "hypothetical": proof.get("hypothetical", False)}
 
 
 def _adjudicate(findings, groups, verification, baselines, ran_axes):
   by_id = {item["id"]: item for item in findings}
+  actionable = []
   for group in groups:
     hits = {}
+    members = []
     for item in group["finding_ids"]:
       row = by_id[item]
       values = hits.setdefault(row["axis"], [])
       if row["severity"] not in values:
         values.append(row["severity"])
-    for item in group["finding_ids"]:
-      row = by_id[item]
-      row.update(classify(row, verification.get(item), baselines.get(group["id"]),
-                          consensus=group["consensus"], corroborated=item in group["corroborated_ids"],
-                          ran_axes=ran_axes))
-      row.update(group_id=group["id"], axis_hits=hits,
-                 uid=finding_uid(row["file"], row["anchor"], row["root_cause"]))
-  return sorted(findings, key=lambda row: BUCKETS.index(row["bucket"]))
+      outcome = classify(row, verification.get(item), baselines.get(group["id"]),
+                         consensus=group["consensus"], corroborated=item in group["corroborated_ids"],
+                         ran_axes=_ran_axes_for(ran_axes, row["file"]))
+      members.append(dict(row, **outcome, group_id=group["id"]))
+    representative = min(members, key=lambda row: (BUCKETS.index(row["bucket"]), not strict_passthrough(row),
+                                                   SEVERITIES.index(row["effective_severity"]), row["axis"] != "primary"))
+    actionable.append(dict(representative, axis_hits=hits,
+                           uid=finding_uid(representative["file"], representative["anchor"], representative["root_cause"]),
+                           member_findings=[row for row in members if row is not representative]))
+  return sorted(actionable, key=lambda row: BUCKETS.index(row["bucket"]))
 
 
 def _drift(pr):
@@ -405,7 +431,7 @@ def _collect(pr, root, client):
   config = client.config
   spec = _spec_context(pr, root, config)
   primary = next((axis for axis in config.axes if axis.id == "primary"), None)
-  chunks = (chunk_files(pr.files) or [[]]) if primary else []
+  chunks = (chunk_files(pr.files, root=root, head_sha=pr.head_sha) or [[]]) if primary else []
   with ThreadPoolExecutor(max_workers=len(config.axes)) as pool:
     tasks = {axis.id: pool.submit(_initial, client, pr, root, spec, axis,
                                  chunks if axis.id == "primary" else [pr.files]) for axis in config.axes}
@@ -424,12 +450,20 @@ def _collect(pr, root, client):
       repair = [(set(run["files"]), run["reply"]) for run in repairs if run["reply"] is not None]
       coverage = coverage_for(pr.files, [*initial, *repair])
   initial_runs = [run for axis_runs in runs.values() for run in axis_runs]
-  findings = _prepare_findings(root, [*initial_runs, *repairs], pr.files)
-  groups, matching = _match(client, root, findings, spec)
-  ran_axes = sum(any(run["reply"] is not None for run in entries) for entries in runs.values())
+  findings = _prepare_findings(root, [*initial_runs, *repairs], pr.files, head_sha=pr.head_sha)
+  groups, matching = _match(client, root, findings, spec, pr)
+  ran_axes = Counter(file for axis, entries in runs.items() if axis != "primary"
+                     for run in entries if run["reply"] is not None for file in run["files"])
+  ran_axes.update(file for file, row in coverage.get("files", {}).items()
+                  if row["status"] in {"covered", NO_ISSUES})
   verification, baselines, batches = _verify(client, root, pr, spec, findings, groups, ran_axes)
   ordered = _adjudicate(findings, groups, verification, baselines, ran_axes)
+  usable = (any(run["reply"] is not None for axis, entries in runs.items() if axis != "primary" for run in entries)
+            or any(row["status"] != "MISSED" for row in coverage.get("files", {}).values()))
+  review_failed = bool(pr.files) and not usable
   return {"pr": dict(asdict(pr), url=pr.url), "language": config.language, "spec": spec,
+          "review_failed": review_failed,
+          "failure_reason": "No initial axis produced a usable reply after repair." if review_failed else None,
           "axes": states, "verifiers": {role: asdict(model) for role, model in config.verifiers.items()},
           "chunks": [[file.path for file in chunk] for chunk in chunks], "coverage": coverage,
           "coverage_repair": repairs, "findings": ordered, "groups": groups, "matching": matching,
@@ -451,7 +485,7 @@ def run_review(pr_url: str, config: Config, out_dir: Path) -> Result:
     root = github.checkout(pr, Path(workdir))
     evidence = _collect(pr, root, client)
   out_dir.mkdir(parents=True, exist_ok=True)
-  report.write_calls(out_dir, client.records, config)
+  evidence["calls"] = report.write_calls(out_dir, client.records, config)
   endpoints = {name: endpoint for name, endpoint in config.endpoints.items() if endpoint.receipts == "phala-aci"}
   evidence["receipts"] = {"state": "N-A (no receipt-enabled endpoint)"}
   if endpoints:
@@ -461,17 +495,18 @@ def run_review(pr_url: str, config: Config, out_dir: Path) -> Result:
       evidence["receipts"] = receipts.process(out_dir, {
         name: {"base_url": target.base_url, "api_key": target.api_key()} for name, target in endpoints.items()
       }, config=config)
-    except (ImportError, OSError, ValueError, RuntimeError) as error:
+    # Receipts are evidence about calls that already finished; losing them must not lose the review itself.
+    except Exception as error:
       evidence["receipts"] = {"state": f"FAILED ({type(error).__name__})"}
-  evidence["drift"] = _drift(pr)
-  evidence["calls"] = report.call_rows(client.records)
   evidence["selfcheck_failures"] = check(evidence, tuple(axis.id for axis in config.axes))
   report.write_evidence(out_dir, evidence, config)
   try:
     from . import tee_quote
 
     tee = tee_quote.write_quote(out_dir, config=config)
-  except (ImportError, OSError, ValueError, RuntimeError) as error:
+  # Every model call is already paid for here; an SDK or socket failure of any type must cost only this section, not the report.
+  except Exception as error:
     tee = {"in_tee": False, "error": f"Application quote failed ({type(error).__name__})"}
+  evidence["drift"] = _drift(pr)
   report.write_report(out_dir, evidence, tee, config)
-  return Result(out_dir, evidence)
+  return Result(out_dir, evidence, evidence["review_failed"], evidence["failure_reason"])

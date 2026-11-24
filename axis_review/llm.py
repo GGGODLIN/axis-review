@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from http.client import HTTPException, IncompleteRead
 from dataclasses import dataclass
@@ -59,7 +60,13 @@ def _retry_delay(value: str | None, fallback: int) -> float:
 
 
 def _string(value) -> str | None:
-  return value if isinstance(value, str) and value.strip() else None
+  if not isinstance(value, str) or not value.strip():
+    return None
+  try:
+    value.encode("utf-8")
+  except UnicodeEncodeError:
+    return None
+  return value.strip()
 
 
 def _decode(payload: bytes) -> dict | None:
@@ -69,6 +76,44 @@ def _decode(payload: bytes) -> dict | None:
   except (ValueError, RecursionError):
     return None
   return result if isinstance(result, dict) else None
+
+
+def _check_json_strings(value, config: Config) -> None:
+  if isinstance(value, str):
+    ensure_no_credentials(value.encode("utf-8", errors="backslashreplace"), config)
+    # Assistant content and tool arguments can themselves carry serialized JSON.
+    text = value.strip()
+    if text.startswith("```") and text.endswith("```"):
+      text = text[3:-3].removeprefix("json").removeprefix("JSON").strip()
+    if text.startswith(("{", "[", '"')):
+      try:
+        embedded = json.loads(text)
+      except ValueError:
+        return
+      _check_json_strings(embedded, config)
+  elif isinstance(value, dict):
+    for key, child in value.items():
+      _check_json_strings(key, config)
+      _check_json_strings(child, config)
+  elif isinstance(value, list):
+    for child in value:
+      _check_json_strings(child, config)
+
+
+def unsafe_body_reason(payload: bytes, config: Config) -> str | None:
+  names = {"GITHUB_TOKEN", *(endpoint.api_key_env for endpoint in config.endpoints.values() if endpoint.api_key_env)}
+  if not any(os.environ.get(name) for name in names):
+    return None
+  try:
+    ensure_no_credentials(payload, config)
+  except ValueError:
+    return "Body contains an environment credential"
+  try:
+    decoded = json.loads(payload)
+    _check_json_strings(decoded, config)
+  except (ValueError, RecursionError):
+    return "Body may contain a credential or could not be safely checked"
+  return None
 
 
 class Client:
@@ -88,10 +133,14 @@ class Client:
       body["tools"] = tools
     if response_format is not None:
       body["response_format"] = response_format
-    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+    try:
+      payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+    except (ValueError, TypeError, RecursionError):
+      raise ChatError("Chat request is not valid UTF-8 JSON") from None
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     try:
-      ensure_no_credentials(payload, self.config)
+      if reason := unsafe_body_reason(payload, self.config):
+        raise ValueError(reason)
       key = target.api_key()
     except ValueError as error:
       raise ChatError(str(error)) from None
@@ -122,11 +171,14 @@ class Client:
         transport_error = type(error).__name__
 
       decoded = _decode(response)
-      fields = decoded if decoded is not None else {}
+      unsafe = unsafe_body_reason(response, self.config)
+      fields = decoded if decoded is not None and unsafe is None else {}
       http_ok = status is not None and 200 <= status < 300
       error_text = transport_error
       if error_text is None and not http_ok:
         error_text = f"HTTP {status}"
+      if error_text is None and unsafe:
+        error_text = unsafe
       if error_text is None and decoded is None:
         error_text = "Response is not a JSON object"
       usage = fields.get("usage")

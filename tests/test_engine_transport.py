@@ -4,12 +4,14 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from axis_review import github, report
-from axis_review.cli import OutputHandler, main
+from axis_review.cli import main
+from axis_review.serve import OutputHandler
 from axis_review.config import Axis, Config, Endpoint, Model, load_config
 from axis_review.github import ChangedFile
 from axis_review.llm import ChatError, Client, UNAVAILABLE
@@ -127,6 +129,52 @@ class TransportTests(unittest.TestCase):
       self.assertEqual(client.records, [])
 
 
+  def test_request_encoding_failure_is_a_chat_error(self):
+    config = Config({"local": Endpoint("http://127.0.0.1")}, (), {})
+    client = Client(config)
+    with patch("axis_review.llm.build_opener") as opener, self.assertRaisesRegex(ChatError, "UTF-8 JSON"):
+      client.chat(phase="verify", axis="neutral", endpoint="local", model="judge",
+                  messages=[{"role": "assistant", "content": "\ud800"}])
+    opener.assert_not_called()
+
+  def test_escaped_response_credential_omits_body_and_keeps_diagnostic_index(self):
+    synthetic = "synthetic-fixture-marker"
+    escaped = ''.join(f"\\u{ord(char):04x}" for char in synthetic).encode()
+    nested = json.dumps({"choices": [{"message": {"content": '{"echo":"' + escaped.decode() + '"}'}}]}).encode()
+    responses = (b'{"error":"' + escaped + b'"}', nested, b"{malformed", b'{"model":"safe"}\n')
+    with patch.dict(os.environ, {"TEST_AXIS_KEY": synthetic}):
+      config = Config({"local": Endpoint("http://127.0.0.1", "TEST_AXIS_KEY")}, (), {})
+      client = Client(config)
+      for payload in responses:
+        response = MagicMock(code=200, headers={})
+        response.__enter__.return_value = response
+        response.read.return_value = payload
+        with patch("axis_review.llm.build_opener") as opener:
+          opener.return_value.open.return_value = response
+          params = dict(phase="initial", axis="neutral", endpoint="local", model="finder", messages=[])
+          if payload == responses[-1]:
+            client.chat(**params)
+          else:
+            with self.assertRaisesRegex(ChatError, "could not be safely checked"):
+              client.chat(**params)
+      with tempfile.TemporaryDirectory() as work:
+        root = Path(work)
+        report.write_calls(root, client.records, config)
+        rows = [json.loads(line) for line in (root / "calls.jsonl").read_bytes().splitlines()]
+        for row in rows[:3]:
+          self.assertIsNone(row["resp_path"])
+          self.assertIn("response_body_hash_unavailable", row)
+          self.assertFalse((root / "bodies" / f"{row['seq']}.resp.json").exists())
+          self.assertTrue((root / row["req_path"]).is_file())
+        self.assertEqual((root / rows[-1]["resp_path"]).read_bytes(), responses[-1])
+
+  def test_usage_distinguishes_omitted_tokens_from_zero(self):
+    usage = report._usage([{"usage": {"total_tokens": 5}}, {"usage": {"completion_tokens": 0}}, {"usage": None}])
+    self.assertIn("total_tokens=5 (1/3 attempts)", usage)
+    self.assertIn("completion_tokens=0 (1/3 attempts)", usage)
+    self.assertNotIn("prompt_tokens", usage)
+
+
 class RepoTests(unittest.TestCase):
   def test_path_confinement_and_truncation(self):
     with tempfile.TemporaryDirectory() as work:
@@ -138,16 +186,85 @@ class RepoTests(unittest.TestCase):
       (repo / "source.py").write_text("one\nneedle\n" + "y" * 13_000, encoding="utf-8")
       (repo / "escape").symlink_to(parent / "outside")
       (repo / "metadata").symlink_to(repo / ".git", target_is_directory=True)
+      settings = {"user.name": "Fixture", "user.email": "fixture@example.invalid"}
+      github._git(["add", "source.py", "escape", "metadata"], repo, settings)
+      tree = github._git(["write-tree"], repo, settings).decode().strip()
+      sha = github._git(["commit-tree", tree, "-m", "Fixture"], repo, settings).decode().strip()
       for file in ("../outside", str(parent / "outside"), "escape", ".git/HEAD", "metadata/HEAD"):
         with self.subTest(file=file):
-          self.assertIn("Tool error", execute("read_file", {"path": file}, repo))
+          self.assertIn("Tool error", execute("read_file", {"path": file}, repo, head_sha=sha))
       self.assertEqual(execute("list_dir", {}, repo), "source.py")
       self.assertEqual(execute("grep", {"pattern": "needle"}, repo), "source.py:2: needle")
       self.assertEqual(execute("grep", {"pattern": "outside sentinel"}, repo), "")
-      self.assertEqual(execute("read_file", {"path": "source.py", "end_line": 2}, repo), "1: one\n2: needle")
-      result = execute("read_file", {"path": "source.py"}, repo)
+      self.assertIn("Pinned head commit is unavailable", execute("read_file", {"path": "source.py"}, repo))
+      self.assertEqual(execute("read_file", {"path": "source.py", "end_line": 2}, repo, head_sha=sha), "1: one\n2: needle")
+      result = execute("read_file", {"path": "source.py"}, repo, head_sha=sha)
       self.assertEqual(len(result), OUTPUT_LIMIT)
       self.assertTrue(result.endswith(TRUNCATED))
+
+  def test_checkout_fetches_pinned_base_and_exposes_path_filtered_pr_history(self):
+    with tempfile.TemporaryDirectory() as work:
+      sandbox = Path(work)
+      remote = sandbox / "remote"
+      remote.mkdir()
+      config = {"user.name": "Fixture", "user.email": "fixture@example.invalid"}
+
+      def git(*args):
+        return github._git(list(args), remote, config).decode().strip()
+
+      git("init", "--quiet", "--template=")
+      (remote / "src.py").write_text("before\nremoved\n", encoding="utf-8")
+      (remote / "deleted.py").write_text("base-only\n", encoding="utf-8")
+      git("add", "src.py", "deleted.py")
+      base = git("commit-tree", git("write-tree"), "-m", "Base commit")
+      (remote / "src.py").write_text("after\n", encoding="utf-8")
+      git("add", "src.py")
+      middle = git("commit-tree", git("write-tree"), "-p", base, "-m", "Move source guard")
+      (remote / "deleted.py").unlink()
+      git("add", "-u", "--", "deleted.py")
+      head = git("commit-tree", git("write-tree"), "-p", middle, "-m", "Remove other file")
+      git("update-ref", "refs/heads/fixture", head)
+      actual_git = github._git
+
+      def local_git(args, cwd, options=None):
+        return actual_git([str(remote) if arg == "https://github.com/fixture/repo.git" else arg for arg in args], cwd, options)
+
+      pr = github.PR("fixture", "repo", 1, "Fixture", "fixture", base, head, [])
+      with patch.object(github, "_git", side_effect=local_git) as calls:
+        root = github.checkout(pr, sandbox)
+      fetches = [call.args[0] for call in calls.call_args_list if call.args[0][0] == "fetch"]
+      self.assertEqual([args[-1] for args in fetches], [head, base])
+      (root / "src.py").write_text("not the blob\n", encoding="utf-8")
+      kwargs = {"base_sha": base, "head_sha": head}
+      self.assertEqual(execute("read_file", {"path": "src.py", "ref": "base"}, root, **kwargs), "1: before\n2: removed")
+      self.assertEqual(execute("read_file", {"path": "src.py"}, root, **kwargs), "1: after")
+      self.assertEqual(execute("read_file", {"path": "deleted.py", "ref": "base"}, root, **kwargs), "1: base-only")
+      self.assertEqual(execute("pr_commits", {"path": "src.py"}, root, **kwargs), f"{middle}\nMove source guard")
+      diff = execute("show_commit_patch", {"path": "src.py", "sha": middle}, root, **kwargs)
+      self.assertIn("-removed", diff)
+      self.assertIn("+after", diff)
+      self.assertIn("outside the pinned PR range", execute("show_commit_patch", {"path": "src.py", "sha": base}, root, **kwargs))
+      self.assertIn("Tool error", execute("read_file", {"path": "src.py", "ref": middle}, root, **kwargs))
+      self.assertIn("Tool error", execute("pr_commits", {"path": "../src.py"}, root, **kwargs))
+
+  def test_truncated_github_body_degrades_fallback_and_drift(self):
+    from axis_review.review import _drift
+
+    reply = MagicMock()
+    reply.__enter__.return_value = reply
+    reply.read.side_effect = IncompleteRead(b"partial", 10)
+    pr = {"base": {"sha": "a" * 40}, "head": {"sha": "b" * 40}, "title": "Change",
+          "user": {"login": "reviewer"}, "changed_files": 1}
+    files = [{"filename": "a.py", "status": "added", "additions": 1, "deletions": 0}]
+    with patch.object(github, "build_opener") as opener:
+      opener.return_value.open.return_value = reply
+      with patch.object(github, "_json", side_effect=[pr, files, pr]):
+        fetched = github.fetch_pr("https://github.com/owner/repo/pull/2")
+      self.assertEqual(_drift(fetched)["state"], "UNAVAILABLE")
+      with self.assertRaisesRegex(github.GitHubError, "IncompleteRead"):
+        github.fetch_pr(fetched.url)
+    self.assertIsNone(fetched.files[0].patch)
+    self.assertIn("IncompleteRead", fetched.material_notes[0])
 
   def test_github_diff_fallback_keeps_quoted_and_deleted_sections(self):
     files = [ChangedFile("doculé space.md", "renamed", 1, 0, None, "old space.md"),
@@ -181,11 +298,12 @@ class CLITests(unittest.TestCase):
     import io
     from contextlib import redirect_stdout
 
-    with tempfile.TemporaryDirectory() as work, patch("axis_review.receipts.verify", return_value={"verified": 1}) as verify:
+    summary = {"verified": 1, "expected": 1}
+    with tempfile.TemporaryDirectory() as work, patch("axis_review.receipts.verify", return_value=summary) as verify:
       with redirect_stdout(io.StringIO()) as output:
         self.assertEqual(main(["verify-receipts", work]), 0)
       verify.assert_called_once_with(Path(work))
-      self.assertEqual(json.loads(output.getvalue()), {"verified": 1})
+      self.assertEqual(json.loads(output.getvalue()), summary)
 
   def test_serve_output_is_static_and_does_not_follow_symlinks(self):
     from functools import partial
@@ -197,11 +315,11 @@ class CLITests(unittest.TestCase):
       root.mkdir()
       (root / "link").symlink_to(parent / "outside")
       (root / "report.md").write_text("# Report\n", encoding="utf-8")
-      with Server(partial(OutputHandler, directory=str(root))) as server:
-        with urlopen(f"{server.base}/report.md", timeout=2) as reply:
+      with Server(partial(OutputHandler, directory=str(root), token="fixture")) as server:
+        with urlopen(f"{server.base}/fixture/report.md", timeout=2) as reply:
           self.assertEqual(reply.read(), b"# Report\n")
           self.assertEqual(reply.headers.get("X-Content-Type-Options"), "nosniff")
-        for path, method, status in (("/link", "GET", 404), ("/report.md", "POST", 501)):
+        for path, method, status in (("/fixture/link", "GET", 404), ("/fixture/report.md", "POST", 501)):
           with self.assertRaises(HTTPError) as raised:
             urlopen(Request(server.base + path, method=method), timeout=2)
           with raised.exception as error:
@@ -215,7 +333,7 @@ class CLITests(unittest.TestCase):
     config = Config({"local": Endpoint("http://127.0.0.1")},
                     (Axis("local", "finder", "neutral"),), {"for_diff_axes": Model("local", "judge")})
     with tempfile.TemporaryDirectory() as work, patch("axis_review.cli.load_config", return_value=config):
-      with patch("axis_review.cli.run_review", side_effect=lambda url, cfg, dest: SimpleNamespace(out_dir=dest)) as run:
+      with patch("axis_review.cli.run_review", side_effect=lambda url, cfg, dest: SimpleNamespace(out_dir=dest, review_failed=False)) as run:
         with redirect_stdout(io.StringIO()) as output:
           code = main(["review", "https://github.com/owner/first/pull/2", "https://github.com/owner/second/pull/2",
                        "https://github.com/Owner/First/pull/2/", "--config", "config.toml", "--out", work])
