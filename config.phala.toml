@@ -5,6 +5,10 @@ base_url = "https://inference.phala.com/v1"
 api_key_env = "PHALA_API_KEY"
 receipts = "phala-aci"
 max_tokens = 32000
+# Measured 2026-11-25: DeepSeek diff-only reviews took 460 s; GLM at its default (max) effort reasoned
+# through all 32000 tokens and returned nothing, while high finished in 129 s.
+timeout_s = 1200
+model_params."z-ai/glm-5.3" = { reasoning_effort = "high" }
 
 [[axes]]
 id = "primary"
