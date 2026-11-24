@@ -1,0 +1,32 @@
+services:
+  axis-review:
+    image: python:3.12
+    platform: linux/amd64
+    environment:
+      PHALA_API_KEY: ${PHALA_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AXIS_REVIEW_REF: ${AXIS_REVIEW_REF}
+      PR_URLS: ${PR_URLS}
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - review-data:/data/out
+    ports:
+      - "8080:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    command:
+      - bash
+      - -ec
+      - |
+        : "$${AXIS_REVIEW_REF:?Set AXIS_REVIEW_REF to a commit SHA}"
+        : "$${PR_URLS:?Set PR_URLS to space-separated GitHub pull request URLs}"
+        python -m pip install --src /app -e "axis-review[tee] @ git+https://github.com/GGGODLIN/axis-review@$${AXIS_REVIEW_REF}"
+        read -r -a pr_urls <<< "$$PR_URLS"
+        axis-review review "$${pr_urls[@]}" --config /app/axis-review/config.phala.toml --out /data/out
+        exec axis-review serve /data/out --port 8080
+
+volumes:
+  review-data:

@@ -1,0 +1,25 @@
+language = "en"
+
+[endpoints.phala]
+base_url = "https://inference.phala.com/v1"
+api_key_env = "PHALA_API_KEY"
+receipts = "phala-aci"
+
+[[axes]]
+id = "primary"
+endpoint = "phala"
+model = "moonshotai/kimi-k3.1-pro"
+
+[[axes]]
+id = "neutral"
+endpoint = "phala"
+model = "z-ai/glm-5.3"
+
+[[axes]]
+id = "adversarial"
+endpoint = "phala"
+model = "deepseek/deepseek-v4.1-flash-1017"
+
+[verifiers]
+for_primary = { endpoint = "phala", model = "z-ai/glm-5.3" }
+for_diff_axes = { endpoint = "phala", model = "moonshotai/kimi-k3.1-pro" }
