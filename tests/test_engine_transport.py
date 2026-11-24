@@ -52,6 +52,15 @@ for_diff_axes = {{endpoint = "local", model = "{verifier}"}}
     with self.assertRaisesRegex(ValueError, "different models"):
       self.config(verifier="finder")
 
+  def test_endpoint_model_params_are_scalar_and_cannot_override_core_fields(self):
+    self.assertEqual(self.config().endpoints["local"].model_params, {})
+    parsed = self.config(extra='model_params."vendor/m" = { reasoning_effort = "low", temperature = 1 }')
+    self.assertEqual(parsed.endpoints["local"].model_params, {"vendor/m": {"reasoning_effort": "low", "temperature": 1}})
+    for bad in ('model_params = 1', 'model_params."vendor/m" = 1', 'model_params."vendor/m" = { messages = "x" }',
+                'model_params."vendor/m" = { max_tokens = 5 }', 'model_params."vendor/m" = { nested = { a = 1 } }'):
+      with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "model_params"):
+        self.config(extra=bad)
+
   def test_endpoint_timeout_is_optional_and_positive(self):
     self.assertIsNone(self.config().endpoints["local"].timeout_s)
     self.assertEqual(self.config(extra="timeout_s = 900").endpoints["local"].timeout_s, 900)
@@ -152,6 +161,29 @@ class TransportTests(unittest.TestCase):
                     messages=[{"role": "user", "content": "x"}])
     self.assertEqual(observed[0]["max_tokens"], 32000)
     self.assertNotIn("max_tokens", observed[1])
+
+  def test_model_params_are_sent_only_for_their_model(self):
+    observed = []
+
+    class Handler(BaseHTTPRequestHandler):
+      def do_POST(self):
+        observed.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"id":"r","model":"m","choices":[]}')
+
+      def log_message(self, *args):
+        pass
+
+    with Server(Handler) as server:
+      config = Config({"local": Endpoint(server.base + "/v1",
+                                         model_params={"tuned": {"reasoning_effort": "low"}})}, (), {})
+      client = Client(config, sleep=lambda seconds: None)
+      for model in ("tuned", "plain"):
+        client.chat(phase="initial", axis="neutral", endpoint="local", model=model,
+                    messages=[{"role": "user", "content": "x"}])
+    self.assertEqual(observed[0]["reasoning_effort"], "low")
+    self.assertNotIn("reasoning_effort", observed[1])
 
   def test_endpoint_timeout_overrides_client_default(self):
     seen = []

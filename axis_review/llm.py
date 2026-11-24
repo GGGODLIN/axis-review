@@ -135,6 +135,7 @@ class Client:
       body["response_format"] = response_format
     if target.max_tokens is not None:
       body["max_tokens"] = target.max_tokens
+    body.update(target.model_params.get(model, {}))
     try:
       payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
     except (ValueError, TypeError, RecursionError):

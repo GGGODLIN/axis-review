@@ -1,7 +1,7 @@
 import json
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -34,6 +34,8 @@ class Endpoint:
   max_tokens: int | None = None
   # Diff-only axes return one long JSON review in a single call; slow providers need minutes, not the client default.
   timeout_s: int | None = None
+  # Per-model request fields such as reasoning_effort; without it GLM on Phala reasons until max_tokens and returns no content.
+  model_params: dict[str, dict] = field(default_factory=dict)
 
   def __post_init__(self) -> None:
     if self.api_key_env is not None:
@@ -89,6 +91,22 @@ def _positive(value, label: str, minimum: int = 1) -> int:
   return value
 
 
+RESERVED_PARAMS = {"model", "messages", "stream", "tools", "response_format", "max_tokens"}
+
+
+def _model_params(raw, name: str) -> dict[str, dict]:
+  label = f"endpoints.{name}.model_params"
+  result = {}
+  for model, params in _table(raw, label).items():
+    params = _table(params, f"{label}.{model}")
+    for key, value in params.items():
+      # Core fields stay owned by the engine so a config cannot change what the receipts and report describe.
+      if key in RESERVED_PARAMS or not isinstance(value, (str, int, float, bool)):
+        raise ValueError(f"{label}.{model}.{key} must be a scalar that does not override a core request field")
+    result[model] = dict(params)
+  return result
+
+
 def _endpoint(raw, name: str) -> Endpoint:
   table = _table(raw, f"endpoints.{name}")
   base_url = _text(table.get("base_url"), f"endpoints.{name}.base_url")
@@ -114,7 +132,8 @@ def _endpoint(raw, name: str) -> Endpoint:
   timeout_s = table.get("timeout_s")
   if timeout_s is not None:
     _positive(timeout_s, f"endpoints.{name}.timeout_s")
-  return Endpoint(base_url.rstrip("/"), key_env, receipts, max_tokens, timeout_s)
+  model_params = _model_params(table.get("model_params", {}), name)
+  return Endpoint(base_url.rstrip("/"), key_env, receipts, max_tokens, timeout_s, model_params)
 
 
 def load_config(path: str | Path) -> Config:
